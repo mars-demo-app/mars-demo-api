@@ -19,17 +19,24 @@ const SEED_MAX = 200_000;
 /** Warn-log successful handlers slower than this (ms). Helps when edge 504s never reach Node. */
 const SLOW_LOG_MS = Math.max(0, Number(process.env.DEMO_SLOW_LOG_MS || 500) || 0);
 
-/** Burn-CPU hard caps (env-overridable). High values can throttle the instance. */
-const BURN_CPU_MAX_MS = Math.max(100, Number(process.env.DEMO_BURN_CPU_MAX_MS || 30_000) || 30_000);
-const BURN_CPU_MAX_WORKERS = Math.max(1, Number(process.env.DEMO_BURN_CPU_MAX_WORKERS || 4) || 4);
-const BURN_CPU_DEFAULT_MS = 5_000;
-const BURN_CPU_DEFAULT_WORKERS = 1;
+/**
+ * Burn-CPU hard caps (env-overridable). Insights often averages over ~1m, so
+ * short burns look tiny — defaults are intentionally long/hot. High values can
+ * throttle the instance.
+ */
+const BURN_CPU_MAX_MS = Math.max(100, Number(process.env.DEMO_BURN_CPU_MAX_MS || 180_000) || 180_000);
+const BURN_CPU_MAX_WORKERS = Math.max(1, Number(process.env.DEMO_BURN_CPU_MAX_WORKERS || 8) || 8);
+const BURN_CPU_DEFAULT_MS = 60_000;
+const BURN_CPU_DEFAULT_WORKERS = 4;
 
-/** Burn-memory hard caps. Instance is apps-s-1vcpu-0.5gb — stay under that. */
-const BURN_MEM_MAX_MB = Math.max(1, Number(process.env.DEMO_BURN_MEM_MAX_MB || 256) || 256);
-const BURN_MEM_MAX_HOLD_MS = Math.max(100, Number(process.env.DEMO_BURN_MEM_MAX_HOLD_MS || 60_000) || 60_000);
-const BURN_MEM_DEFAULT_MB = 96;
-const BURN_MEM_DEFAULT_HOLD_MS = 15_000;
+/**
+ * Burn-memory hard caps. Instance is apps-s-1vcpu-0.5gb — defaults aim to fill
+ * most of RSS for a clear Insights blip; max can OOM/restart.
+ */
+const BURN_MEM_MAX_MB = Math.max(1, Number(process.env.DEMO_BURN_MEM_MAX_MB || 450) || 450);
+const BURN_MEM_MAX_HOLD_MS = Math.max(100, Number(process.env.DEMO_BURN_MEM_MAX_HOLD_MS || 180_000) || 180_000);
+const BURN_MEM_DEFAULT_MB = 380;
+const BURN_MEM_DEFAULT_HOLD_MS = 60_000;
 
 const MARKER_5XX = "MARS_DEMO_5XX";
 const MARKER_SLOW = "MARS_DEMO_SLOW";
@@ -43,6 +50,8 @@ let peakInflight = 0;
 let saturatedTotal = 0;
 let cpuBurnsActive = 0;
 let memBurnsActive = 0;
+/** Retained during memory burns so V8 cannot GC the allocation early. */
+const retainedMemChunks = [];
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -375,16 +384,31 @@ function clampInt(raw, fallback, min, max) {
   return Math.min(max, Math.max(min, Math.floor(n)));
 }
 
-/** Busy-loop in a worker thread so the HTTP event loop (and /health) stay responsive. */
+function rssMb() {
+  return Math.round((process.memoryUsage().rss / (1024 * 1024)) * 10) / 10;
+}
+
+/**
+ * Sync-spin worker: huge inner loops, Date.now() only between chunks so the
+ * core stays pegged. Runs off the HTTP event loop.
+ */
 function runCpuWorker(durationMs) {
   const source = `
     const { parentPort, workerData } = require("node:worker_threads");
     const end = Date.now() + workerData.durationMs;
-    let acc = 0;
+    let x = 0x12345678;
+    let y = 0x9e3779b9;
+    let ops = 0;
     while (Date.now() < end) {
-      for (let i = 0; i < 1000; i++) acc += Math.sqrt(acc + i + 1);
+      // ~tens of millions of integer ops before the next clock check
+      for (let i = 0; i < 5_000_000; i++) {
+        x = Math.imul(x, 1664525) + 1013904223;
+        y = Math.imul(y ^ (y << 13), 1274126177);
+        x ^= y;
+      }
+      ops += 5_000_000;
     }
-    parentPort.postMessage({ ok: true, acc });
+    parentPort.postMessage({ ok: true, ops, x });
   `;
   return new Promise((resolve, reject) => {
     const worker = new Worker(source, {
@@ -410,7 +434,9 @@ function runCpuWorker(durationMs) {
 
 /**
  * POST/GET /api/demo/burn-cpu
- * Params: duration_ms (default 5000), workers (default 1). Hard-capped by env.
+ * Starts hot worker-thread spins in the background and returns 202 immediately
+ * so gateway timeouts do not cut a long burn short.
+ * Params: duration_ms (default 60000), workers (default 4).
  */
 async function handleBurnCpu(req, res, url) {
   const body = req.method === "POST" ? await readJson(req) : {};
@@ -443,53 +469,78 @@ async function handleBurnCpu(req, res, url) {
       event: "start",
       duration_ms: durationMs,
       workers,
+      rss_mb: rssMb(),
+      mode: "background",
       caps: { max_ms: BURN_CPU_MAX_MS, max_workers: BURN_CPU_MAX_WORKERS },
     })
   );
-  try {
-    await Promise.all(Array.from({ length: workers }, () => runCpuWorker(durationMs)));
-    const took_ms = Date.now() - started;
-    console.error(
-      JSON.stringify({
-        marker: MARKER_BURN_CPU,
-        event: "end",
-        duration_ms: durationMs,
-        workers,
-        took_ms,
-      })
-    );
-    return json(res, 200, {
-      ok: true,
-      burn: "cpu",
-      duration_ms: durationMs,
-      workers,
-      took_ms,
-      marker: MARKER_BURN_CPU,
-      note: "Worker-thread busy loops — watch Insights CPU for this window",
+
+  Promise.all(Array.from({ length: workers }, () => runCpuWorker(durationMs)))
+    .then((results) => {
+      const took_ms = Date.now() - started;
+      const ops = results.reduce((n, r) => n + (r.ops || 0), 0);
+      console.error(
+        JSON.stringify({
+          marker: MARKER_BURN_CPU,
+          event: "end",
+          duration_ms: durationMs,
+          workers,
+          took_ms,
+          ops,
+          rss_mb: rssMb(),
+        })
+      );
+    })
+    .catch((err) => {
+      console.error(
+        JSON.stringify({
+          marker: MARKER_BURN_CPU,
+          event: "error",
+          error: err.message,
+          rss_mb: rssMb(),
+        })
+      );
+    })
+    .finally(() => {
+      cpuBurnsActive -= 1;
     });
-  } catch (err) {
-    console.error(
-      JSON.stringify({
-        marker: MARKER_BURN_CPU,
-        event: "error",
-        error: err.message,
-      })
-    );
-    return json(
-      res,
-      500,
-      { error: err.message || "cpu burn failed", marker: MARKER_BURN_CPU },
-      { skipFiveXxLog: true }
-    );
-  } finally {
-    cpuBurnsActive -= 1;
+
+  return json(res, 202, {
+    ok: true,
+    accepted: true,
+    burn: "cpu",
+    duration_ms: durationMs,
+    workers,
+    marker: MARKER_BURN_CPU,
+    rss_mb: rssMb(),
+    note:
+      "CPU burn running in background worker threads — watch Insights CPU for ~duration_ms; logs emit MARS_DEMO_BURN_CPU start/end",
+  });
+}
+
+/**
+ * Allocate+touch memory in chunks, retain globally for hold_ms, then release.
+ * Returns 202 after allocation so long holds are not cut by gateway timeouts.
+ */
+function allocateRetainedMemory(mb) {
+  const chunkMb = 32;
+  const chunks = [];
+  let allocated = 0;
+  while (allocated < mb) {
+    const thisMb = Math.min(chunkMb, mb - allocated);
+    const buf = Buffer.allocUnsafe(thisMb * 1024 * 1024);
+    // Force physical pages into RSS (allocUnsafe is uninitialized).
+    for (let i = 0; i < buf.length; i += 4096) buf[i] = 0xaa;
+    buf[buf.length - 1] = 0x55;
+    chunks.push(buf);
+    allocated += thisMb;
   }
+  return chunks;
 }
 
 /**
  * POST/GET /api/demo/burn-memory
- * Params: mb (default 96), hold_ms (default 15000). Hard-capped by env.
- * Allocates, touches pages, holds, then drops references (no process.exit).
+ * Params: mb (default 380), hold_ms (default 60000). Hard-capped by env.
  */
 async function handleBurnMemory(req, res, url) {
   const body = req.method === "POST" ? await readJson(req) : {};
@@ -515,52 +566,34 @@ async function handleBurnMemory(req, res, url) {
   }
 
   memBurnsActive += 1;
-  const bytes = mb * 1024 * 1024;
   const started = Date.now();
+  const rssBefore = rssMb();
   console.error(
     JSON.stringify({
       marker: MARKER_BURN_MEM,
       event: "start",
       mb,
       hold_ms: holdMs,
-      bytes,
+      rss_mb: rssBefore,
+      mode: "background",
       caps: { max_mb: BURN_MEM_MAX_MB, max_hold_ms: BURN_MEM_MAX_HOLD_MS },
       warning: "High mb can OOM/restart a small App Platform instance",
     })
   );
 
-  let buf = null;
+  let chunks;
   try {
-    buf = Buffer.alloc(bytes);
-    // Touch pages so RSS actually grows (lazy alloc otherwise).
-    for (let i = 0; i < buf.length; i += 4096) buf[i] = 1;
-    await sleep(holdMs);
-    const took_ms = Date.now() - started;
-    console.error(
-      JSON.stringify({
-        marker: MARKER_BURN_MEM,
-        event: "end",
-        mb,
-        hold_ms: holdMs,
-        took_ms,
-      })
-    );
-    return json(res, 200, {
-      ok: true,
-      burn: "memory",
-      mb,
-      hold_ms: holdMs,
-      took_ms,
-      marker: MARKER_BURN_MEM,
-      note: "Buffer held then released — watch Insights memory for this window",
-    });
+    chunks = allocateRetainedMemory(mb);
+    retainedMemChunks.push(...chunks);
   } catch (err) {
+    memBurnsActive -= 1;
     console.error(
       JSON.stringify({
         marker: MARKER_BURN_MEM,
         event: "error",
         mb,
         error: err.message,
+        rss_mb: rssMb(),
       })
     );
     return json(
@@ -569,14 +602,47 @@ async function handleBurnMemory(req, res, url) {
       {
         error: err.message || "memory burn failed",
         marker: MARKER_BURN_MEM,
+        rss_mb: rssMb(),
         hint: "Allocation failed — lower mb (instance may be near its memory cap)",
       },
       { skipFiveXxLog: true }
     );
-  } finally {
-    buf = null;
-    memBurnsActive -= 1;
   }
+
+  const rssAfterAlloc = rssMb();
+  setTimeout(() => {
+    for (const buf of chunks) {
+      const idx = retainedMemChunks.indexOf(buf);
+      if (idx >= 0) retainedMemChunks.splice(idx, 1);
+    }
+    chunks.length = 0;
+    memBurnsActive -= 1;
+    console.error(
+      JSON.stringify({
+        marker: MARKER_BURN_MEM,
+        event: "end",
+        mb,
+        hold_ms: holdMs,
+        took_ms: Date.now() - started,
+        rss_mb: rssMb(),
+        retained_chunks: retainedMemChunks.length,
+      })
+    );
+  }, holdMs);
+
+  return json(res, 202, {
+    ok: true,
+    accepted: true,
+    burn: "memory",
+    mb,
+    hold_ms: holdMs,
+    marker: MARKER_BURN_MEM,
+    rss_mb_before: rssBefore,
+    rss_mb_after_alloc: rssAfterAlloc,
+    retained_chunks: retainedMemChunks.length,
+    note:
+      "Memory retained in-process for hold_ms — watch Insights memory; logs emit MARS_DEMO_BURN_MEM start/end",
+  });
 }
 
 const server = http.createServer(async (req, res) => {

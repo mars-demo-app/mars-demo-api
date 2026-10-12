@@ -48,24 +48,32 @@ Defaults are safe for normal browsing (no artificial delay, unlimited inflight).
 | `DEMO_MAX_INFLIGHT` | `0` | Cap concurrent non-health handlers; `0` = unlimited. Over cap → HTTP 503 |
 | `DEMO_PG_POOL_MAX` | `5` | pg pool size (small → connection wait under hammer) |
 | `DEMO_SLOW_LOG_MS` | `500` | Warn-log successful handlers slower than this (`MARS_DEMO_SLOW`) |
-| `DEMO_BURN_CPU_MAX_MS` | `30000` | Hard cap for `/demo/burn-cpu` duration |
-| `DEMO_BURN_CPU_MAX_WORKERS` | `4` | Hard cap for concurrent CPU worker threads |
-| `DEMO_BURN_MEM_MAX_MB` | `256` | Hard cap for `/demo/burn-memory` allocation |
-| `DEMO_BURN_MEM_MAX_HOLD_MS` | `60000` | Hard cap for memory hold duration |
+| `DEMO_BURN_CPU_MAX_MS` | `180000` | Hard cap for `/demo/burn-cpu` duration |
+| `DEMO_BURN_CPU_MAX_WORKERS` | `8` | Hard cap for concurrent CPU worker threads |
+| `DEMO_BURN_MEM_MAX_MB` | `450` | Hard cap for `/demo/burn-memory` allocation |
+| `DEMO_BURN_MEM_MAX_HOLD_MS` | `180000` | Hard cap for memory hold duration |
 
 ### Burn demos (CPU / memory)
 
-Safe defaults; absurd values are clamped. High knobs can **CPU-throttle or OOM** a small App Platform instance (current size is `apps-s-1vcpu-0.5gb`).
+Returns **202 Accepted** and burns in the background (so gateway timeouts do not cut a long burn). High knobs can **CPU-throttle or OOM** a small App Platform instance (`apps-s-1vcpu-0.5gb`).
 
 | Endpoint | Defaults | Max (env) |
 | --- | --- | --- |
-| `/api/demo/burn-cpu` | `duration_ms=5000`, `workers=1` | 30s / 4 workers |
-| `/api/demo/burn-memory` | `mb=96`, `hold_ms=15000` | 256 MB / 60s |
+| `/api/demo/burn-cpu` | `duration_ms=60000`, `workers=4` | 180s / 8 workers |
+| `/api/demo/burn-memory` | `mb=380`, `hold_ms=60000` | 450 MB / 180s |
 
 ```bash
+# UI defaults (strong — good Insights blip on ~1m average windows)
 curl -sS -X POST https://mars-demo-4qji6.ondigitalocean.app/api/demo/burn-cpu \
-  -H 'Content-Type: application/json' -d '{"duration_ms":8000,"workers":2}'
-curl -sS 'https://mars-demo-4qji6.ondigitalocean.app/api/demo/burn-memory?mb=128&hold_ms=20000'
+  -H 'Content-Type: application/json' -d '{"duration_ms":60000,"workers":4}'
+curl -sS -X POST https://mars-demo-4qji6.ondigitalocean.app/api/demo/burn-memory \
+  -H 'Content-Type: application/json' -d '{"mb":380,"hold_ms":60000}'
+
+# Near-max (may OOM / heavily throttle the 0.5 GiB instance)
+curl -sS -X POST https://mars-demo-4qji6.ondigitalocean.app/api/demo/burn-cpu \
+  -H 'Content-Type: application/json' -d '{"duration_ms":180000,"workers":8}'
+curl -sS -X POST https://mars-demo-4qji6.ondigitalocean.app/api/demo/burn-memory \
+  -H 'Content-Type: application/json' -d '{"mb":450,"hold_ms":120000}'
 ```
 
 ### Log markers (App Platform `api` runtime logs)
