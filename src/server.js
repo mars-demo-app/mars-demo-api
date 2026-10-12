@@ -185,14 +185,23 @@ async function withDemoLoad(res, work) {
 }
 
 async function handleHealth(_req, res) {
+  // Keep /api/health cheap: exact COUNT(*) over multi-million seed rows
+  // saturates the small pg pool and trips App Platform readiness / gateway 504s.
+  // Use planner estimate (reltuples) so the demo still shows scale.
   let db = "skipped";
   let orderCount = null;
+  let orderCountApprox = false;
   if (pool) {
     try {
       await pool.query("SELECT 1");
       db = "ok";
-      const count = await pool.query("SELECT COUNT(*)::bigint AS n FROM orders");
+      const count = await pool.query(
+        `SELECT GREATEST(reltuples, 0)::bigint AS n
+         FROM pg_class
+         WHERE oid = 'public.orders'::regclass`
+      );
       orderCount = Number(count.rows[0].n);
+      orderCountApprox = true;
     } catch (err) {
       db = `error: ${err.message}`;
       return json(res, 503, { ok: false, db, service: "mars-demo-api" });
@@ -203,6 +212,7 @@ async function handleHealth(_req, res) {
     service: "mars-demo-api",
     db,
     order_count: orderCount,
+    order_count_approx: orderCountApprox,
     crash_after_requests: CRASH_AFTER || null,
     requests_seen: requestCount,
     demo: {
