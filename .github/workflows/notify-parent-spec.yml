@@ -1,0 +1,27 @@
+# When this component's App Platform fragment changes, ask the parent
+# repo to refresh submodules and recompose .do/app.yaml.
+name: notify-parent-spec
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".do/**"
+      - ".github/workflows/notify-parent-spec.yml"
+  workflow_dispatch:
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch parent compose-app-spec
+        env:
+          GH_TOKEN: ${{ secrets.PARENT_DISPATCH_TOKEN }}
+        run: |
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "::warning::PARENT_DISPATCH_TOKEN not set; parent will catch up on schedule/workflow_dispatch"
+            exit 0
+          fi
+          gh workflow run compose-app-spec.yml \
+            --repo hugocorbucci/mars-demo-app \
+            -f reason="mars-demo-api@${GITHUB_SHA}"
