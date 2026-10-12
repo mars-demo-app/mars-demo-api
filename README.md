@@ -20,6 +20,7 @@ Backend HTTP service for the **Mars Demo Shop** on DigitalOcean App Platform.
 | `GET` | `/api/health` (or `/health`) | Liveness + DB ping |
 | `GET` | `/api/orders` | Recent orders |
 | `POST` | `/api/orders` | Create order `{ customer_email, amount_cents }` |
+| `POST` | `/api/orders/cancel` | Soft-cancel order `{ id }` → `status: cancelled` |
 | `GET` | `/api/orders/by-email?email=` | Unindexed lookup (latent-bug demo path) |
 
 ## Local run

@@ -129,6 +129,38 @@ async function handleLookupByEmail(req, res, url) {
   json(res, 200, { email, took_ms: Date.now() - started, orders: rows });
 }
 
+// Soft-cancel: set status to 'cancelled'. Idempotent if already cancelled.
+async function handleCancelOrder(req, res) {
+  if (!pool) return json(res, 503, { error: "DATABASE_URL not configured" });
+  const body = await readJson(req);
+  const id = Number(body.id);
+  if (!Number.isFinite(id) || id <= 0) {
+    return json(res, 400, { error: "positive numeric id is required" });
+  }
+
+  const existing = await pool.query(
+    `SELECT id, customer_email, amount_cents, status, created_at
+     FROM orders WHERE id = $1`,
+    [Math.floor(id)]
+  );
+  if (!existing.rowCount) {
+    return json(res, 404, { error: "order not found", id: Math.floor(id) });
+  }
+  const order = existing.rows[0];
+  if (order.status === "cancelled") {
+    return json(res, 200, { order, already_cancelled: true });
+  }
+
+  const { rows } = await pool.query(
+    `UPDATE orders SET status = 'cancelled'
+     WHERE id = $1
+     RETURNING id, customer_email, amount_cents, status, created_at`,
+    [Math.floor(id)]
+  );
+  maybeCrashAfterSuccess();
+  json(res, 200, { order: rows[0], already_cancelled: false });
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
@@ -141,6 +173,10 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === "GET" && path === "/orders") {
       return await handleListOrders(req, res);
+    }
+    // Must be registered before POST /orders.
+    if (req.method === "POST" && path === "/orders/cancel") {
+      return await handleCancelOrder(req, res);
     }
     if (req.method === "POST" && path === "/orders") {
       return await handleCreateOrder(req, res);
