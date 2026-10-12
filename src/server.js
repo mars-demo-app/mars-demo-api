@@ -29,11 +29,16 @@ const BURN_CPU_MAX_MS = Math.max(100, Number(process.env.DEMO_BURN_CPU_MAX_MS ||
 const BURN_CPU_DEFAULT_MS = 90_000;
 const BURN_CPU_DEFAULT_DUTY = Math.min(
   0.9,
-  Math.max(0.1, Number(process.env.DEMO_BURN_CPU_DUTY || 0.55) || 0.55)
+  Math.max(0.1, Number(process.env.DEMO_BURN_CPU_DUTY || 0.35) || 0.35)
 );
 const BURN_CPU_DEFAULT_SLICE_MS = Math.max(
   5,
-  Math.min(100, Number(process.env.DEMO_BURN_CPU_SLICE_MS || 20) || 20)
+  Math.min(100, Number(process.env.DEMO_BURN_CPU_SLICE_MS || 12) || 12)
+);
+/** Hard cap on one busy burst so HTTP can answer between spins. */
+const BURN_CPU_MAX_BUSY_MS = Math.max(
+  1,
+  Math.min(20, Number(process.env.DEMO_BURN_CPU_MAX_BUSY_MS || 6) || 6)
 );
 
 /**
@@ -215,6 +220,7 @@ async function handleHealth(_req, res) {
         cpu_default_ms: BURN_CPU_DEFAULT_MS,
         cpu_default_duty: BURN_CPU_DEFAULT_DUTY,
         cpu_default_slice_ms: BURN_CPU_DEFAULT_SLICE_MS,
+        cpu_max_busy_ms: BURN_CPU_MAX_BUSY_MS,
         mem_max_mb: BURN_MEM_MAX_MB,
         mem_max_hold_ms: BURN_MEM_MAX_HOLD_MS,
       },
@@ -400,26 +406,40 @@ function rssMb() {
 }
 
 /**
- * Short busy bursts on the event loop, then setTimeout yield.
- * Caps each busy window (~duty*slice, default ~11ms) so HTTP/health interleave.
+ * Short busy bursts on the event loop, then yield via setTimeout.
+ * Defaults (~4ms busy / ~8ms yield @ duty 0.35 / slice 12) keep health+API
+ * answering while average CPU stays elevated for a ~60–90s Insights window.
  */
+function yieldFor(ms) {
+  return new Promise((resolve) => {
+    if (ms <= 1) {
+      setImmediate(resolve);
+      return;
+    }
+    setTimeout(resolve, ms);
+  });
+}
+
 async function dutyCycleCpuBurn(durationMs, dutyCycle, sliceMs) {
   const end = performance.now() + durationMs;
   let ops = 0;
   let slices = 0;
   let x = 0x12345678;
   while (performance.now() < end) {
-    const workMs = Math.max(1, Math.min(15, Math.floor(sliceMs * dutyCycle)));
+    const workMs = Math.max(
+      1,
+      Math.min(BURN_CPU_MAX_BUSY_MS, Math.floor(sliceMs * dutyCycle))
+    );
     const pauseMs = Math.max(1, sliceMs - workMs);
     const sliceEnd = performance.now() + workMs;
     while (performance.now() < sliceEnd) {
-      for (let i = 0; i < 2_000; i++) {
+      for (let i = 0; i < 512; i++) {
         x = Math.imul(x, 1664525) + 1013904223;
       }
-      ops += 2_000;
+      ops += 512;
     }
     slices += 1;
-    await new Promise((resolve) => setTimeout(resolve, pauseMs));
+    await yieldFor(pauseMs);
   }
   return { ops, slices, x };
 }
@@ -427,7 +447,7 @@ async function dutyCycleCpuBurn(durationMs, dutyCycle, sliceMs) {
 /**
  * POST/GET /api/demo/burn-cpu
  * Background duty-cycled burn; returns 202 immediately.
- * Params: duration_ms (default 90000), duty_cycle (default 0.55), slice_ms (default 20).
+ * Params: duration_ms (default 90000), duty_cycle (default 0.35), slice_ms (default 12).
  * Legacy `workers` ignored — worker pegs cause 504s on 1 vCPU.
  */
 async function handleBurnCpu(req, res, url) {
@@ -461,8 +481,11 @@ async function handleBurnCpu(req, res, url) {
 
   cpuBurnsActive += 1;
   const started = Date.now();
-  const workMs = Math.max(1, Math.min(15, Math.floor(sliceMs * dutyCycle)));
-  const yieldMs = Math.max(1, sliceMs - workMs);
+  const workMs = Math.max(
+    1,
+    Math.min(BURN_CPU_MAX_BUSY_MS, Math.floor(sliceMs * dutyCycle))
+  );
+  const pauseMs = Math.max(1, sliceMs - workMs);
   console.error(
     JSON.stringify({
       marker: MARKER_BURN_CPU,
@@ -471,7 +494,7 @@ async function handleBurnCpu(req, res, url) {
       duty_cycle: dutyCycle,
       slice_ms: sliceMs,
       work_ms_per_slice: workMs,
-      yield_ms_per_slice: yieldMs,
+      yield_ms_per_slice: pauseMs,
       mode: "duty_cycle_event_loop",
       rss_mb: rssMb(),
       caps: { max_ms: BURN_CPU_MAX_MS },
@@ -518,7 +541,7 @@ async function handleBurnCpu(req, res, url) {
     duty_cycle: dutyCycle,
     slice_ms: sliceMs,
     work_ms_per_slice: workMs,
-    yield_ms_per_slice: yieldMs,
+    yield_ms_per_slice: pauseMs,
     marker: MARKER_BURN_CPU,
     rss_mb: rssMb(),
     note:
