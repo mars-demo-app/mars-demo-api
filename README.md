@@ -109,12 +109,3 @@ This repo owns its App Platform component config in [`.do/component.yaml`](.do/c
 The parent [`mars-demo-app`](https://github.com/mars-demo-app/mars-demo-app) tracks this repo as a git submodule and merges fragments into `.do/app.yaml`.
 
 When `.do/**` changes on `main`, workflow `notify-parent-spec` dispatches the parent's `compose-app-spec` workflow (requires secret `PARENT_DISPATCH_TOKEN`).
-
-## Demo PR: broken cancel
-
-On branch `demo/mars-error-log-marker`, `POST /api/orders/cancel` is intentionally broken:
-it attempts an invalid column update, returns HTTP 500, and prints a JSON line containing
-the searchable marker `MARS_DEMO_ERROR_LOG` (no process exit).
-
-Demo flow: merge → open the shop UI → **Cancel latest order** → see failure → search
-runtime logs for `MARS_DEMO_ERROR_LOG` → launch a MARS investigation.
