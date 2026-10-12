@@ -15,6 +15,12 @@ const MAX_INFLIGHT = Math.max(0, Number(process.env.DEMO_MAX_INFLIGHT || 0) || 0
 const PG_POOL_MAX = Math.max(1, Number(process.env.DEMO_PG_POOL_MAX || 5) || 5);
 /** Hard cap for one-click seed endpoint. */
 const SEED_MAX = 200_000;
+/** Warn-log successful handlers slower than this (ms). Helps when edge 504s never reach Node. */
+const SLOW_LOG_MS = Math.max(0, Number(process.env.DEMO_SLOW_LOG_MS || 500) || 0);
+
+const MARKER_5XX = "MARS_DEMO_5XX";
+const MARKER_SLOW = "MARS_DEMO_SLOW";
+const MARKER_CANCEL_BREAK = "MARS_DEMO_ERROR_LOG";
 
 let requestCount = 0;
 let inflight = 0;
@@ -48,13 +54,57 @@ function pgPoolConfig(url) {
 
 const pool = DATABASE_URL ? new Pool(pgPoolConfig(DATABASE_URL)) : null;
 
-function json(res, status, body) {
+function bindRequestContext(req, res, path) {
+  res.__mars = {
+    method: req.method || "GET",
+    path: path || "/",
+  };
+}
+
+/**
+ * Send JSON. Every 5xx logs once with marker MARS_DEMO_5XX unless the body
+ * already carries MARS_DEMO_ERROR_LOG (cancel-break path logs its own line).
+ */
+function json(res, status, body, opts = {}) {
+  if (status >= 500 && !opts.skipFiveXxLog && body?.marker !== MARKER_CANCEL_BREAK) {
+    const ctx = res.__mars || {};
+    console.error(
+      JSON.stringify({
+        marker: MARKER_5XX,
+        level: "error",
+        status,
+        method: ctx.method || null,
+        path: ctx.path || null,
+        error: body?.error || body?.db || "server error",
+        detail: body?.hint || body?.marker || null,
+        inflight,
+        demo_max_inflight: MAX_INFLIGHT || null,
+      })
+    );
+  }
   const payload = JSON.stringify(body);
   res.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
     "Cache-Control": "no-store",
   });
   res.end(payload);
+}
+
+function maybeLogSlow(res, tookMs, extra = {}) {
+  if (!SLOW_LOG_MS || tookMs < SLOW_LOG_MS) return;
+  const ctx = res.__mars || {};
+  console.warn(
+    JSON.stringify({
+      marker: MARKER_SLOW,
+      level: "warn",
+      status: 200,
+      method: ctx.method || null,
+      path: ctx.path || null,
+      took_ms: tookMs,
+      threshold_ms: SLOW_LOG_MS,
+      ...extra,
+    })
+  );
 }
 
 function maybeCrashAfterSuccess() {
@@ -121,9 +171,11 @@ async function handleHealth(_req, res) {
       handler_delay_ms: HANDLER_DELAY_MS,
       max_inflight: MAX_INFLIGHT || null,
       pg_pool_max: PG_POOL_MAX,
+      slow_log_ms: SLOW_LOG_MS || null,
       inflight,
       peak_inflight: peakInflight,
       saturated_total: saturatedTotal,
+      log_markers: { five_xx: MARKER_5XX, slow: MARKER_SLOW },
     },
   });
 }
@@ -179,9 +231,11 @@ async function handleLookupByEmail(req, res, url) {
       [email]
     );
     maybeCrashAfterSuccess();
+    const took_ms = Date.now() - started;
+    maybeLogSlow(res, took_ms, { email, rows: rows.length, kind: "by-email" });
     json(res, 200, {
       email,
-      took_ms: Date.now() - started,
+      took_ms,
       orders: rows,
       note: "customer_email has no index on main — concurrent hammers congest the DB",
     });
@@ -268,24 +322,31 @@ async function handleSeedOrders(req, res) {
     );
   }
   const after = await pool.query("SELECT COUNT(*)::bigint AS n FROM orders");
+  const took_ms = Date.now() - started;
+  maybeLogSlow(res, took_ms, {
+    kind: "seed-orders",
+    inserted_bulk: count,
+    orders_after: Number(after.rows[0].n),
+  });
   json(res, 200, {
     inserted_bulk: count,
     inserted_hotpath: hotpathExtra,
     hotpath_email: hotpath,
     orders_before: Number(before.rows[0].n),
     orders_after: Number(after.rows[0].n),
-    took_ms: Date.now() - started,
+    took_ms,
     reminder: "No index on customer_email — use Hammer lookups next",
   });
 }
 
 const server = http.createServer(async (req, res) => {
-  try {
-    const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
-    // App Platform ingress strips nothing by default when matching /api prefix;
-    // accept both /api/... and /... for local runs.
-    const path = url.pathname.replace(/^\/api/, "") || "/";
+  const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+  // App Platform ingress strips nothing by default when matching /api prefix;
+  // accept both /api/... and /... for local runs.
+  const path = url.pathname.replace(/^\/api/, "") || "/";
+  bindRequestContext(req, res, path);
 
+  try {
     if (req.method === "GET" && (path === "/health" || path === "/")) {
       return await handleHealth(req, res);
     }
@@ -307,8 +368,19 @@ const server = http.createServer(async (req, res) => {
     }
     json(res, 404, { error: "not found" });
   } catch (err) {
-    console.error(err);
-    json(res, 500, { error: err.message || "internal error" });
+    // Structured 5xx log comes from json(); keep a one-line stack for operators.
+    console.error(
+      JSON.stringify({
+        marker: MARKER_5XX,
+        level: "error",
+        event: "unhandled_handler_error",
+        method: req.method || null,
+        path,
+        error: err.message || "internal error",
+        stack: typeof err.stack === "string" ? err.stack.split("\n").slice(0, 4) : null,
+      })
+    );
+    json(res, 500, { error: err.message || "internal error" }, { skipFiveXxLog: true });
   }
 });
 

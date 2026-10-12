@@ -45,6 +45,17 @@ Defaults are safe for normal browsing (no artificial delay, unlimited inflight).
 | `DEMO_HANDLER_DELAY_MS` | `0` | Artificial delay on non-health handlers (scale demo) |
 | `DEMO_MAX_INFLIGHT` | `0` | Cap concurrent non-health handlers; `0` = unlimited. Over cap → HTTP 503 |
 | `DEMO_PG_POOL_MAX` | `5` | pg pool size (small → connection wait under hammer) |
+| `DEMO_SLOW_LOG_MS` | `500` | Warn-log successful handlers slower than this (`MARS_DEMO_SLOW`) |
+
+### Log markers (App Platform `api` runtime logs)
+
+| Marker | When |
+| --- | --- |
+| **`MARS_DEMO_5XX`** | Any HTTP 5xx the Node process returns (503 saturated, 500 handler errors, etc.) |
+| **`MARS_DEMO_SLOW`** | Successful handler slower than `DEMO_SLOW_LOG_MS` (by-email hammer / seed) |
+| **`MARS_DEMO_ERROR_LOG`** | Cancel-break demo PR only (skips a duplicate `MARS_DEMO_5XX` line) |
+
+Platform edge **504**s (gateway timeout with no response from the container) cannot be logged by the app. Hammer/Seed should still produce `MARS_DEMO_SLOW` and any app-emitted `MARS_DEMO_5XX` (e.g. 503 when `DEMO_MAX_INFLIGHT` is set).
 
 ### Suggested App Platform values for scale demo (mode C)
 
