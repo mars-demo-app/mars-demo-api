@@ -2,7 +2,6 @@
 
 const http = require("node:http");
 const { URL } = require("node:url");
-const { Worker } = require("node:worker_threads");
 const { Pool } = require("pg");
 
 const PORT = Number(process.env.PORT || 8080);
@@ -20,14 +19,21 @@ const SEED_MAX = 200_000;
 const SLOW_LOG_MS = Math.max(0, Number(process.env.DEMO_SLOW_LOG_MS || 500) || 0);
 
 /**
- * Burn-CPU hard caps (env-overridable). Insights often averages over ~1m, so
- * short burns look tiny — defaults are intentionally long/hot. High values can
- * throttle the instance.
+ * Burn-CPU: duty-cycled busy/yield on the event loop so HTTP stays responsive
+ * while average CPU stays elevated for a ~60–90s Insights window.
+ * (Hard worker-thread pegging caused gateway 504s on 1 vCPU while averages
+ * still looked low — see playbook D.)
  */
 const BURN_CPU_MAX_MS = Math.max(100, Number(process.env.DEMO_BURN_CPU_MAX_MS || 180_000) || 180_000);
-const BURN_CPU_MAX_WORKERS = Math.max(1, Number(process.env.DEMO_BURN_CPU_MAX_WORKERS || 8) || 8);
-const BURN_CPU_DEFAULT_MS = 60_000;
-const BURN_CPU_DEFAULT_WORKERS = 4;
+const BURN_CPU_DEFAULT_MS = 90_000;
+const BURN_CPU_DEFAULT_DUTY = Math.min(
+  0.95,
+  Math.max(0.1, Number(process.env.DEMO_BURN_CPU_DUTY || 0.7) || 0.7)
+);
+const BURN_CPU_DEFAULT_SLICE_MS = Math.max(
+  5,
+  Math.min(200, Number(process.env.DEMO_BURN_CPU_SLICE_MS || 40) || 40)
+);
 
 /**
  * Burn-memory hard caps. Instance is apps-s-1vcpu-0.5gb — defaults aim to fill
@@ -205,7 +211,9 @@ async function handleHealth(_req, res) {
       mem_burns_active: memBurnsActive,
       burn_caps: {
         cpu_max_ms: BURN_CPU_MAX_MS,
-        cpu_max_workers: BURN_CPU_MAX_WORKERS,
+        cpu_default_ms: BURN_CPU_DEFAULT_MS,
+        cpu_default_duty: BURN_CPU_DEFAULT_DUTY,
+        cpu_default_slice_ms: BURN_CPU_DEFAULT_SLICE_MS,
         mem_max_mb: BURN_MEM_MAX_MB,
         mem_max_hold_ms: BURN_MEM_MAX_HOLD_MS,
       },
@@ -384,59 +392,54 @@ function clampInt(raw, fallback, min, max) {
   return Math.min(max, Math.max(min, Math.floor(n)));
 }
 
+function clampFloat(raw, fallback, min, max) {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+}
+
 function rssMb() {
   return Math.round((process.memoryUsage().rss / (1024 * 1024)) * 10) / 10;
 }
 
+function yieldEventLoop(ms) {
+  if (ms <= 0) {
+    return new Promise((resolve) => setImmediate(resolve));
+  }
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 /**
- * Sync-spin worker: huge inner loops, Date.now() only between chunks so the
- * core stays pegged. Runs off the HTTP event loop.
+ * Duty-cycled burn on the main event loop: busy-spin for duty*slice, then
+ * yield so HTTP/health can run. Sustains elevated average CPU for duration_ms
+ * without pegging the only vCPU into gateway 504s.
  */
-function runCpuWorker(durationMs) {
-  const source = `
-    const { parentPort, workerData } = require("node:worker_threads");
-    const end = Date.now() + workerData.durationMs;
-    let x = 0x12345678;
-    let y = 0x9e3779b9;
-    let ops = 0;
-    while (Date.now() < end) {
-      // ~tens of millions of integer ops before the next clock check
-      for (let i = 0; i < 5_000_000; i++) {
+async function dutyCycleCpuBurn(durationMs, dutyCycle, sliceMs) {
+  const end = Date.now() + durationMs;
+  let ops = 0;
+  let slices = 0;
+  let x = 0x12345678;
+  while (Date.now() < end) {
+    const workMs = Math.max(1, Math.floor(sliceMs * dutyCycle));
+    const pauseMs = Math.max(0, sliceMs - workMs);
+    const sliceEnd = Date.now() + workMs;
+    while (Date.now() < sliceEnd) {
+      for (let i = 0; i < 25_000; i++) {
         x = Math.imul(x, 1664525) + 1013904223;
-        y = Math.imul(y ^ (y << 13), 1274126177);
-        x ^= y;
       }
-      ops += 5_000_000;
+      ops += 25_000;
     }
-    parentPort.postMessage({ ok: true, ops, x });
-  `;
-  return new Promise((resolve, reject) => {
-    const worker = new Worker(source, {
-      eval: true,
-      workerData: { durationMs },
-    });
-    let settled = false;
-    worker.on("message", (msg) => {
-      settled = true;
-      resolve(msg);
-    });
-    worker.on("error", (err) => {
-      settled = true;
-      reject(err);
-    });
-    worker.on("exit", (code) => {
-      if (!settled && code !== 0) {
-        reject(new Error(`cpu worker exited with code ${code}`));
-      }
-    });
-  });
+    slices += 1;
+    await yieldEventLoop(pauseMs);
+  }
+  return { ops, slices, x };
 }
 
 /**
  * POST/GET /api/demo/burn-cpu
- * Starts hot worker-thread spins in the background and returns 202 immediately
- * so gateway timeouts do not cut a long burn short.
- * Params: duration_ms (default 60000), workers (default 4).
+ * Starts a background duty-cycled burn; returns 202 immediately.
+ * Params: duration_ms (default 90000), duty_cycle (default 0.7), slice_ms (default 40).
+ * Legacy `workers` is ignored (hard workers caused 504s on 1 vCPU).
  */
 async function handleBurnCpu(req, res, url) {
   const body = req.method === "POST" ? await readJson(req) : {};
@@ -446,18 +449,24 @@ async function handleBurnCpu(req, res, url) {
     100,
     BURN_CPU_MAX_MS
   );
-  const workers = clampInt(
-    body.workers ?? url.searchParams.get("workers"),
-    BURN_CPU_DEFAULT_WORKERS,
-    1,
-    BURN_CPU_MAX_WORKERS
+  const dutyCycle = clampFloat(
+    body.duty_cycle ?? url.searchParams.get("duty_cycle"),
+    BURN_CPU_DEFAULT_DUTY,
+    0.1,
+    0.95
+  );
+  const sliceMs = clampInt(
+    body.slice_ms ?? url.searchParams.get("slice_ms"),
+    BURN_CPU_DEFAULT_SLICE_MS,
+    5,
+    200
   );
 
-  if (cpuBurnsActive >= 2) {
+  if (cpuBurnsActive >= 1) {
     return json(res, 429, {
       error: "cpu burn already in progress",
       cpu_burns_active: cpuBurnsActive,
-      hint: "wait for the current burn to finish",
+      hint: "wait for the current burn to finish (only one sustained burn at a time)",
     });
   }
 
@@ -468,25 +477,27 @@ async function handleBurnCpu(req, res, url) {
       marker: MARKER_BURN_CPU,
       event: "start",
       duration_ms: durationMs,
-      workers,
+      duty_cycle: dutyCycle,
+      slice_ms: sliceMs,
+      mode: "duty_cycle",
       rss_mb: rssMb(),
-      mode: "background",
-      caps: { max_ms: BURN_CPU_MAX_MS, max_workers: BURN_CPU_MAX_WORKERS },
+      caps: { max_ms: BURN_CPU_MAX_MS },
+      note: "yields every slice so HTTP/health stay responsive on 1 vCPU",
     })
   );
 
-  Promise.all(Array.from({ length: workers }, () => runCpuWorker(durationMs)))
-    .then((results) => {
-      const took_ms = Date.now() - started;
-      const ops = results.reduce((n, r) => n + (r.ops || 0), 0);
+  dutyCycleCpuBurn(durationMs, dutyCycle, sliceMs)
+    .then((result) => {
       console.error(
         JSON.stringify({
           marker: MARKER_BURN_CPU,
           event: "end",
           duration_ms: durationMs,
-          workers,
-          took_ms,
-          ops,
+          duty_cycle: dutyCycle,
+          slice_ms: sliceMs,
+          took_ms: Date.now() - started,
+          ops: result.ops,
+          slices: result.slices,
           rss_mb: rssMb(),
         })
       );
@@ -509,12 +520,16 @@ async function handleBurnCpu(req, res, url) {
     ok: true,
     accepted: true,
     burn: "cpu",
+    mode: "duty_cycle",
     duration_ms: durationMs,
-    workers,
+    duty_cycle: dutyCycle,
+    slice_ms: sliceMs,
+    work_ms_per_slice: Math.floor(sliceMs * dutyCycle),
+    yield_ms_per_slice: Math.max(0, sliceMs - Math.floor(sliceMs * dutyCycle)),
     marker: MARKER_BURN_CPU,
     rss_mb: rssMb(),
     note:
-      "CPU burn running in background worker threads — watch Insights CPU for ~duration_ms; logs emit MARS_DEMO_BURN_CPU start/end",
+      "Sustained duty-cycled burn (busy then yield) — watch Insights CPU over ~duration_ms; HTTP should stay healthy (no hard worker peg)",
   });
 }
 

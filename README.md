@@ -49,31 +49,35 @@ Defaults are safe for normal browsing (no artificial delay, unlimited inflight).
 | `DEMO_PG_POOL_MAX` | `5` | pg pool size (small → connection wait under hammer) |
 | `DEMO_SLOW_LOG_MS` | `500` | Warn-log successful handlers slower than this (`MARS_DEMO_SLOW`) |
 | `DEMO_BURN_CPU_MAX_MS` | `180000` | Hard cap for `/demo/burn-cpu` duration |
-| `DEMO_BURN_CPU_MAX_WORKERS` | `8` | Hard cap for concurrent CPU worker threads |
+| `DEMO_BURN_CPU_DUTY` | `0.7` | Default duty cycle (fraction of each slice spent busy) |
+| `DEMO_BURN_CPU_SLICE_MS` | `40` | Busy+yield slice length |
 | `DEMO_BURN_MEM_MAX_MB` | `450` | Hard cap for `/demo/burn-memory` allocation |
 | `DEMO_BURN_MEM_MAX_HOLD_MS` | `180000` | Hard cap for memory hold duration |
 
 ### Burn demos (CPU / memory)
 
-Returns **202 Accepted** and burns in the background (so gateway timeouts do not cut a long burn). High knobs can **CPU-throttle or OOM** a small App Platform instance (`apps-s-1vcpu-0.5gb`).
+Returns **202 Accepted** and burns in the background.
 
-| Endpoint | Defaults | Max (env) |
+**CPU** uses a **duty-cycled** busy/yield loop on the event loop (`duty_cycle` × `slice_ms` busy, then yield). That keeps HTTP/health responsive on a **1 vCPU** instance while holding elevated average CPU for 60–90s (graph-friendly). Hard worker-thread pegging is intentionally gone — it caused gateway **504**s while Insights averages still looked low.
+
+| Endpoint | Defaults | Max / notes |
 | --- | --- | --- |
-| `/api/demo/burn-cpu` | `duration_ms=60000`, `workers=4` | 180s / 8 workers |
+| `/api/demo/burn-cpu` | `duration_ms=90000`, `duty_cycle=0.7`, `slice_ms=40` | duration max 180s; duty 0.1–0.95 |
 | `/api/demo/burn-memory` | `mb=380`, `hold_ms=60000` | 450 MB / 180s |
 
 ```bash
-# UI defaults (strong — good Insights blip on ~1m average windows)
+# UI default — sustained ~90s (should not 504 other requests)
 curl -sS -X POST https://mars-demo-4qji6.ondigitalocean.app/api/demo/burn-cpu \
-  -H 'Content-Type: application/json' -d '{"duration_ms":60000,"workers":4}'
+  -H 'Content-Type: application/json' \
+  -d '{"duration_ms":90000,"duty_cycle":0.7,"slice_ms":40}'
+
+# Hotter but still yielding (more average CPU, still answer HTTP)
+curl -sS -X POST https://mars-demo-4qji6.ondigitalocean.app/api/demo/burn-cpu \
+  -H 'Content-Type: application/json' \
+  -d '{"duration_ms":120000,"duty_cycle":0.85,"slice_ms":40}'
+
 curl -sS -X POST https://mars-demo-4qji6.ondigitalocean.app/api/demo/burn-memory \
   -H 'Content-Type: application/json' -d '{"mb":380,"hold_ms":60000}'
-
-# Near-max (may OOM / heavily throttle the 0.5 GiB instance)
-curl -sS -X POST https://mars-demo-4qji6.ondigitalocean.app/api/demo/burn-cpu \
-  -H 'Content-Type: application/json' -d '{"duration_ms":180000,"workers":8}'
-curl -sS -X POST https://mars-demo-4qji6.ondigitalocean.app/api/demo/burn-memory \
-  -H 'Content-Type: application/json' -d '{"mb":450,"hold_ms":120000}'
 ```
 
 ### Log markers (App Platform `api` runtime logs)
