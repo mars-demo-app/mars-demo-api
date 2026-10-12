@@ -2,6 +2,7 @@
 
 const http = require("node:http");
 const { URL } = require("node:url");
+const { Worker } = require("node:worker_threads");
 const { Pool } = require("pg");
 
 const PORT = Number(process.env.PORT || 8080);
@@ -18,14 +19,30 @@ const SEED_MAX = 200_000;
 /** Warn-log successful handlers slower than this (ms). Helps when edge 504s never reach Node. */
 const SLOW_LOG_MS = Math.max(0, Number(process.env.DEMO_SLOW_LOG_MS || 500) || 0);
 
+/** Burn-CPU hard caps (env-overridable). High values can throttle the instance. */
+const BURN_CPU_MAX_MS = Math.max(100, Number(process.env.DEMO_BURN_CPU_MAX_MS || 30_000) || 30_000);
+const BURN_CPU_MAX_WORKERS = Math.max(1, Number(process.env.DEMO_BURN_CPU_MAX_WORKERS || 4) || 4);
+const BURN_CPU_DEFAULT_MS = 5_000;
+const BURN_CPU_DEFAULT_WORKERS = 1;
+
+/** Burn-memory hard caps. Instance is apps-s-1vcpu-0.5gb — stay under that. */
+const BURN_MEM_MAX_MB = Math.max(1, Number(process.env.DEMO_BURN_MEM_MAX_MB || 256) || 256);
+const BURN_MEM_MAX_HOLD_MS = Math.max(100, Number(process.env.DEMO_BURN_MEM_MAX_HOLD_MS || 60_000) || 60_000);
+const BURN_MEM_DEFAULT_MB = 96;
+const BURN_MEM_DEFAULT_HOLD_MS = 15_000;
+
 const MARKER_5XX = "MARS_DEMO_5XX";
 const MARKER_SLOW = "MARS_DEMO_SLOW";
 const MARKER_CANCEL_BREAK = "MARS_DEMO_ERROR_LOG";
+const MARKER_BURN_CPU = "MARS_DEMO_BURN_CPU";
+const MARKER_BURN_MEM = "MARS_DEMO_BURN_MEM";
 
 let requestCount = 0;
 let inflight = 0;
 let peakInflight = 0;
 let saturatedTotal = 0;
+let cpuBurnsActive = 0;
+let memBurnsActive = 0;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -175,7 +192,20 @@ async function handleHealth(_req, res) {
       inflight,
       peak_inflight: peakInflight,
       saturated_total: saturatedTotal,
-      log_markers: { five_xx: MARKER_5XX, slow: MARKER_SLOW },
+      cpu_burns_active: cpuBurnsActive,
+      mem_burns_active: memBurnsActive,
+      burn_caps: {
+        cpu_max_ms: BURN_CPU_MAX_MS,
+        cpu_max_workers: BURN_CPU_MAX_WORKERS,
+        mem_max_mb: BURN_MEM_MAX_MB,
+        mem_max_hold_ms: BURN_MEM_MAX_HOLD_MS,
+      },
+      log_markers: {
+        five_xx: MARKER_5XX,
+        slow: MARKER_SLOW,
+        burn_cpu: MARKER_BURN_CPU,
+        burn_mem: MARKER_BURN_MEM,
+      },
     },
   });
 }
@@ -339,6 +369,216 @@ async function handleSeedOrders(req, res) {
   });
 }
 
+function clampInt(raw, fallback, min, max) {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, Math.floor(n)));
+}
+
+/** Busy-loop in a worker thread so the HTTP event loop (and /health) stay responsive. */
+function runCpuWorker(durationMs) {
+  const source = `
+    const { parentPort, workerData } = require("node:worker_threads");
+    const end = Date.now() + workerData.durationMs;
+    let acc = 0;
+    while (Date.now() < end) {
+      for (let i = 0; i < 1000; i++) acc += Math.sqrt(acc + i + 1);
+    }
+    parentPort.postMessage({ ok: true, acc });
+  `;
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(source, {
+      eval: true,
+      workerData: { durationMs },
+    });
+    let settled = false;
+    worker.on("message", (msg) => {
+      settled = true;
+      resolve(msg);
+    });
+    worker.on("error", (err) => {
+      settled = true;
+      reject(err);
+    });
+    worker.on("exit", (code) => {
+      if (!settled && code !== 0) {
+        reject(new Error(`cpu worker exited with code ${code}`));
+      }
+    });
+  });
+}
+
+/**
+ * POST/GET /api/demo/burn-cpu
+ * Params: duration_ms (default 5000), workers (default 1). Hard-capped by env.
+ */
+async function handleBurnCpu(req, res, url) {
+  const body = req.method === "POST" ? await readJson(req) : {};
+  const durationMs = clampInt(
+    body.duration_ms ?? url.searchParams.get("duration_ms"),
+    BURN_CPU_DEFAULT_MS,
+    100,
+    BURN_CPU_MAX_MS
+  );
+  const workers = clampInt(
+    body.workers ?? url.searchParams.get("workers"),
+    BURN_CPU_DEFAULT_WORKERS,
+    1,
+    BURN_CPU_MAX_WORKERS
+  );
+
+  if (cpuBurnsActive >= 2) {
+    return json(res, 429, {
+      error: "cpu burn already in progress",
+      cpu_burns_active: cpuBurnsActive,
+      hint: "wait for the current burn to finish",
+    });
+  }
+
+  cpuBurnsActive += 1;
+  const started = Date.now();
+  console.error(
+    JSON.stringify({
+      marker: MARKER_BURN_CPU,
+      event: "start",
+      duration_ms: durationMs,
+      workers,
+      caps: { max_ms: BURN_CPU_MAX_MS, max_workers: BURN_CPU_MAX_WORKERS },
+    })
+  );
+  try {
+    await Promise.all(Array.from({ length: workers }, () => runCpuWorker(durationMs)));
+    const took_ms = Date.now() - started;
+    console.error(
+      JSON.stringify({
+        marker: MARKER_BURN_CPU,
+        event: "end",
+        duration_ms: durationMs,
+        workers,
+        took_ms,
+      })
+    );
+    return json(res, 200, {
+      ok: true,
+      burn: "cpu",
+      duration_ms: durationMs,
+      workers,
+      took_ms,
+      marker: MARKER_BURN_CPU,
+      note: "Worker-thread busy loops — watch Insights CPU for this window",
+    });
+  } catch (err) {
+    console.error(
+      JSON.stringify({
+        marker: MARKER_BURN_CPU,
+        event: "error",
+        error: err.message,
+      })
+    );
+    return json(
+      res,
+      500,
+      { error: err.message || "cpu burn failed", marker: MARKER_BURN_CPU },
+      { skipFiveXxLog: true }
+    );
+  } finally {
+    cpuBurnsActive -= 1;
+  }
+}
+
+/**
+ * POST/GET /api/demo/burn-memory
+ * Params: mb (default 96), hold_ms (default 15000). Hard-capped by env.
+ * Allocates, touches pages, holds, then drops references (no process.exit).
+ */
+async function handleBurnMemory(req, res, url) {
+  const body = req.method === "POST" ? await readJson(req) : {};
+  const mb = clampInt(
+    body.mb ?? url.searchParams.get("mb"),
+    BURN_MEM_DEFAULT_MB,
+    1,
+    BURN_MEM_MAX_MB
+  );
+  const holdMs = clampInt(
+    body.hold_ms ?? url.searchParams.get("hold_ms"),
+    BURN_MEM_DEFAULT_HOLD_MS,
+    100,
+    BURN_MEM_MAX_HOLD_MS
+  );
+
+  if (memBurnsActive >= 2) {
+    return json(res, 429, {
+      error: "memory burn already in progress",
+      mem_burns_active: memBurnsActive,
+      hint: "wait for the current burn to finish",
+    });
+  }
+
+  memBurnsActive += 1;
+  const bytes = mb * 1024 * 1024;
+  const started = Date.now();
+  console.error(
+    JSON.stringify({
+      marker: MARKER_BURN_MEM,
+      event: "start",
+      mb,
+      hold_ms: holdMs,
+      bytes,
+      caps: { max_mb: BURN_MEM_MAX_MB, max_hold_ms: BURN_MEM_MAX_HOLD_MS },
+      warning: "High mb can OOM/restart a small App Platform instance",
+    })
+  );
+
+  let buf = null;
+  try {
+    buf = Buffer.alloc(bytes);
+    // Touch pages so RSS actually grows (lazy alloc otherwise).
+    for (let i = 0; i < buf.length; i += 4096) buf[i] = 1;
+    await sleep(holdMs);
+    const took_ms = Date.now() - started;
+    console.error(
+      JSON.stringify({
+        marker: MARKER_BURN_MEM,
+        event: "end",
+        mb,
+        hold_ms: holdMs,
+        took_ms,
+      })
+    );
+    return json(res, 200, {
+      ok: true,
+      burn: "memory",
+      mb,
+      hold_ms: holdMs,
+      took_ms,
+      marker: MARKER_BURN_MEM,
+      note: "Buffer held then released — watch Insights memory for this window",
+    });
+  } catch (err) {
+    console.error(
+      JSON.stringify({
+        marker: MARKER_BURN_MEM,
+        event: "error",
+        mb,
+        error: err.message,
+      })
+    );
+    return json(
+      res,
+      500,
+      {
+        error: err.message || "memory burn failed",
+        marker: MARKER_BURN_MEM,
+        hint: "Allocation failed — lower mb (instance may be near its memory cap)",
+      },
+      { skipFiveXxLog: true }
+    );
+  } finally {
+    buf = null;
+    memBurnsActive -= 1;
+  }
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
   // App Platform ingress strips nothing by default when matching /api prefix;
@@ -365,6 +605,18 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === "POST" && path === "/demo/seed-orders") {
       return await handleSeedOrders(req, res);
+    }
+    if (
+      (req.method === "POST" || req.method === "GET") &&
+      path === "/demo/burn-cpu"
+    ) {
+      return await handleBurnCpu(req, res, url);
+    }
+    if (
+      (req.method === "POST" || req.method === "GET") &&
+      path === "/demo/burn-memory"
+    ) {
+      return await handleBurnMemory(req, res, url);
     }
     json(res, 404, { error: "not found" });
   } catch (err) {
