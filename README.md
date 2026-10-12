@@ -49,8 +49,8 @@ Defaults are safe for normal browsing (no artificial delay, unlimited inflight).
 | `DEMO_PG_POOL_MAX` | `5` | pg pool size (small → connection wait under hammer) |
 | `DEMO_SLOW_LOG_MS` | `500` | Warn-log successful handlers slower than this (`MARS_DEMO_SLOW`) |
 | `DEMO_BURN_CPU_MAX_MS` | `180000` | Hard cap for `/demo/burn-cpu` duration |
-| `DEMO_BURN_CPU_DUTY` | `0.7` | Default duty cycle (fraction of each slice spent busy) |
-| `DEMO_BURN_CPU_SLICE_MS` | `40` | Busy+yield slice length |
+| `DEMO_BURN_CPU_DUTY` | `0.55` | Default duty cycle (fraction of each slice spent busy) |
+| `DEMO_BURN_CPU_SLICE_MS` | `20` | Busy+yield slice length |
 | `DEMO_BURN_MEM_MAX_MB` | `450` | Hard cap for `/demo/burn-memory` allocation |
 | `DEMO_BURN_MEM_MAX_HOLD_MS` | `180000` | Hard cap for memory hold duration |
 
@@ -58,11 +58,12 @@ Defaults are safe for normal browsing (no artificial delay, unlimited inflight).
 
 Returns **202 Accepted** and burns in the background.
 
-**CPU** uses a **duty-cycled** single worker (busy then Atomics.wait sleep) (`duty_cycle` × `slice_ms` busy, then yield). That keeps HTTP/health responsive on a **1 vCPU** instance while holding elevated average CPU for 60–90s (graph-friendly). Hard worker-thread pegging is intentionally gone — it caused gateway **504**s while Insights averages still looked low.
+**CPU** uses short event-loop busy bursts (`duty_cycle × slice_ms`, capped ~15ms) then `setTimeout` yield. On **1 vCPU**, a busy worker thread still starves HTTP via the OS scheduler (gateway **504**) even when Insights averages look low — so we do **not** peg workers for the demo.
+
 
 | Endpoint | Defaults | Max / notes |
 | --- | --- | --- |
-| `/api/demo/burn-cpu` | `duration_ms=90000`, `duty_cycle=0.7`, `slice_ms=50` | duration max 180s; duty 0.1–0.95 |
+| `/api/demo/burn-cpu` | `duration_ms=90000`, `duty_cycle=0.55`, `slice_ms=20` | duration max 180s; duty 0.1–0.95 |
 | `/api/demo/burn-memory` | `mb=380`, `hold_ms=60000` | 450 MB / 180s |
 
 ```bash

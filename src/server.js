@@ -2,8 +2,8 @@
 
 const http = require("node:http");
 const { URL } = require("node:url");
-const { Worker } = require("node:worker_threads");
 const { Pool } = require("pg");
+const { performance } = require("node:perf_hooks");
 
 const PORT = Number(process.env.PORT || 8080);
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -20,19 +20,20 @@ const SEED_MAX = 200_000;
 const SLOW_LOG_MS = Math.max(0, Number(process.env.DEMO_SLOW_LOG_MS || 500) || 0);
 
 /**
- * Burn-CPU: one duty-cycled worker thread (busy then Atomics.wait sleep) so the
- * HTTP event loop stays free. Sustains ~duty_cycle average CPU for 60–90s
- * without gateway 504s. Hard multi-worker pegging is intentionally avoided.
+ * Burn-CPU: short duty-cycled busy/yield on the event loop.
+ * On 1 vCPU, a busy worker_thread still starves HTTP via the OS scheduler
+ * (→ gateway 504) even while Insights averages look low. Keeping bursts
+ * short (≤~10ms) lets health/API run between spins for a sustained graph.
  */
 const BURN_CPU_MAX_MS = Math.max(100, Number(process.env.DEMO_BURN_CPU_MAX_MS || 180_000) || 180_000);
 const BURN_CPU_DEFAULT_MS = 90_000;
 const BURN_CPU_DEFAULT_DUTY = Math.min(
-  0.95,
-  Math.max(0.1, Number(process.env.DEMO_BURN_CPU_DUTY || 0.7) || 0.7)
+  0.9,
+  Math.max(0.1, Number(process.env.DEMO_BURN_CPU_DUTY || 0.55) || 0.55)
 );
 const BURN_CPU_DEFAULT_SLICE_MS = Math.max(
   5,
-  Math.min(200, Number(process.env.DEMO_BURN_CPU_SLICE_MS || 50) || 50)
+  Math.min(100, Number(process.env.DEMO_BURN_CPU_SLICE_MS || 20) || 20)
 );
 
 /**
@@ -214,7 +215,6 @@ async function handleHealth(_req, res) {
         cpu_default_ms: BURN_CPU_DEFAULT_MS,
         cpu_default_duty: BURN_CPU_DEFAULT_DUTY,
         cpu_default_slice_ms: BURN_CPU_DEFAULT_SLICE_MS,
-        cpu_workers: 1,
         mem_max_mb: BURN_MEM_MAX_MB,
         mem_max_hold_ms: BURN_MEM_MAX_HOLD_MS,
       },
@@ -400,62 +400,35 @@ function rssMb() {
 }
 
 /**
- * One worker: busy-spin for duty*slice, then Atomics.wait sleep. The HTTP
- * event loop never runs the busy work, so health/API stay responsive on 1 vCPU
- * while process CPU averages near the duty cycle for duration_ms.
+ * Short busy bursts on the event loop, then setTimeout yield.
+ * Caps each busy window (~duty*slice, default ~11ms) so HTTP/health interleave.
  */
-function runDutyCycleWorker(durationMs, dutyCycle, sliceMs) {
-  const source = `
-    const { parentPort, workerData } = require("node:worker_threads");
-    const { durationMs, dutyCycle, sliceMs } = workerData;
-    const end = Date.now() + durationMs;
-    let ops = 0;
-    let slices = 0;
-    let x = 0x12345678;
-    const sab = new SharedArrayBuffer(4);
-    const ia = new Int32Array(sab);
-    while (Date.now() < end) {
-      const workMs = Math.max(1, Math.floor(sliceMs * dutyCycle));
-      const pauseMs = Math.max(1, sliceMs - workMs);
-      const sliceEnd = Date.now() + workMs;
-      while (Date.now() < sliceEnd) {
-        for (let i = 0; i < 10_000; i++) {
-          x = Math.imul(x, 1664525) + 1013904223;
-        }
-        ops += 10_000;
+async function dutyCycleCpuBurn(durationMs, dutyCycle, sliceMs) {
+  const end = performance.now() + durationMs;
+  let ops = 0;
+  let slices = 0;
+  let x = 0x12345678;
+  while (performance.now() < end) {
+    const workMs = Math.max(1, Math.min(15, Math.floor(sliceMs * dutyCycle)));
+    const pauseMs = Math.max(1, sliceMs - workMs);
+    const sliceEnd = performance.now() + workMs;
+    while (performance.now() < sliceEnd) {
+      for (let i = 0; i < 2_000; i++) {
+        x = Math.imul(x, 1664525) + 1013904223;
       }
-      slices += 1;
-      Atomics.wait(ia, 0, 0, pauseMs);
+      ops += 2_000;
     }
-    parentPort.postMessage({ ok: true, ops, slices, x });
-  `;
-  return new Promise((resolve, reject) => {
-    const worker = new Worker(source, {
-      eval: true,
-      workerData: { durationMs, dutyCycle, sliceMs },
-    });
-    let settled = false;
-    worker.on("message", (msg) => {
-      settled = true;
-      resolve(msg);
-    });
-    worker.on("error", (err) => {
-      settled = true;
-      reject(err);
-    });
-    worker.on("exit", (code) => {
-      if (!settled && code !== 0) {
-        reject(new Error(`cpu duty worker exited with code ${code}`));
-      }
-    });
-  });
+    slices += 1;
+    await new Promise((resolve) => setTimeout(resolve, pauseMs));
+  }
+  return { ops, slices, x };
 }
 
 /**
  * POST/GET /api/demo/burn-cpu
- * Starts one background duty-cycled worker; returns 202 immediately.
- * Params: duration_ms (default 90000), duty_cycle (default 0.7), slice_ms (default 50).
- * Legacy `workers` is ignored (multi hard-workers caused 504s on 1 vCPU).
+ * Background duty-cycled burn; returns 202 immediately.
+ * Params: duration_ms (default 90000), duty_cycle (default 0.55), slice_ms (default 20).
+ * Legacy `workers` ignored — worker pegs cause 504s on 1 vCPU.
  */
 async function handleBurnCpu(req, res, url) {
   const body = req.method === "POST" ? await readJson(req) : {};
@@ -469,13 +442,13 @@ async function handleBurnCpu(req, res, url) {
     body.duty_cycle ?? url.searchParams.get("duty_cycle"),
     BURN_CPU_DEFAULT_DUTY,
     0.1,
-    0.95
+    0.9
   );
   const sliceMs = clampInt(
     body.slice_ms ?? url.searchParams.get("slice_ms"),
     BURN_CPU_DEFAULT_SLICE_MS,
     5,
-    200
+    100
   );
 
   if (cpuBurnsActive >= 1) {
@@ -488,7 +461,7 @@ async function handleBurnCpu(req, res, url) {
 
   cpuBurnsActive += 1;
   const started = Date.now();
-  const workMs = Math.floor(sliceMs * dutyCycle);
+  const workMs = Math.max(1, Math.min(15, Math.floor(sliceMs * dutyCycle)));
   const yieldMs = Math.max(1, sliceMs - workMs);
   console.error(
     JSON.stringify({
@@ -499,15 +472,14 @@ async function handleBurnCpu(req, res, url) {
       slice_ms: sliceMs,
       work_ms_per_slice: workMs,
       yield_ms_per_slice: yieldMs,
-      mode: "duty_cycle_worker",
-      workers: 1,
+      mode: "duty_cycle_event_loop",
       rss_mb: rssMb(),
       caps: { max_ms: BURN_CPU_MAX_MS },
-      note: "single worker busy/sleep; HTTP event loop stays free",
+      note: "short busy bursts + setTimeout yield; avoids 1-vCPU worker starvation 504s",
     })
   );
 
-  runDutyCycleWorker(durationMs, dutyCycle, sliceMs)
+  dutyCycleCpuBurn(durationMs, dutyCycle, sliceMs)
     .then((result) => {
       console.error(
         JSON.stringify({
@@ -541,17 +513,16 @@ async function handleBurnCpu(req, res, url) {
     ok: true,
     accepted: true,
     burn: "cpu",
-    mode: "duty_cycle_worker",
+    mode: "duty_cycle_event_loop",
     duration_ms: durationMs,
     duty_cycle: dutyCycle,
     slice_ms: sliceMs,
     work_ms_per_slice: workMs,
     yield_ms_per_slice: yieldMs,
-    workers: 1,
     marker: MARKER_BURN_CPU,
     rss_mb: rssMb(),
     note:
-      "Single duty-cycled worker (busy then sleep) — HTTP stays free; watch Insights CPU over ~duration_ms",
+      "Sustained short busy/yield burn — HTTP should stay healthy; watch Insights CPU over ~duration_ms",
   });
 }
 
