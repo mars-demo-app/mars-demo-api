@@ -4,6 +4,7 @@ const http = require("node:http");
 const { URL } = require("node:url");
 const { Pool } = require("pg");
 const { performance } = require("node:perf_hooks");
+const fs = require("node:fs");
 
 const PORT = Number(process.env.PORT || 8080);
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -42,19 +43,33 @@ const BURN_CPU_MAX_BUSY_MS = Math.max(
 );
 
 /**
- * Burn-memory hard caps. Instance is apps-s-1vcpu-0.5gb — defaults aim to fill
- * most of RSS for a clear Insights blip; max can OOM/restart.
+ * Burn-memory: grow RSS toward target_pct of the instance memory limit, then hold.
+ * apps-s-1vcpu-0.5gb ≈ 512MiB cgroup — never allocate past the target (default 90%)
+ * so HTTP keeps headroom. Two concurrent fixed retains previously OOM'd (exit 128).
  */
-const BURN_MEM_MAX_MB = Math.max(1, Number(process.env.DEMO_BURN_MEM_MAX_MB || 450) || 450);
 const BURN_MEM_MAX_HOLD_MS = Math.max(100, Number(process.env.DEMO_BURN_MEM_MAX_HOLD_MS || 180_000) || 180_000);
-const BURN_MEM_DEFAULT_MB = 380;
 const BURN_MEM_DEFAULT_HOLD_MS = 60_000;
+const BURN_MEM_DEFAULT_TARGET_PCT = Math.min(
+  0.95,
+  Math.max(0.5, Number(process.env.DEMO_BURN_MEM_TARGET_PCT || 0.9) || 0.9)
+);
+/** Chunk size while approaching the target (keeps alloc incremental + yields). */
+const BURN_MEM_CHUNK_MB = Math.max(
+  1,
+  Math.min(64, Number(process.env.DEMO_BURN_MEM_CHUNK_MB || 16) || 16)
+);
+/** Fallback when cgroup / DEMO_MEM_LIMIT_MB unavailable (App Platform 0.5gb slug). */
+const BURN_MEM_LIMIT_FALLBACK_MB = Math.max(
+  64,
+  Number(process.env.DEMO_MEM_LIMIT_MB || process.env.DEMO_BURN_MEM_LIMIT_MB || 512) || 512
+);
 
 const MARKER_5XX = "MARS_DEMO_5XX";
 const MARKER_SLOW = "MARS_DEMO_SLOW";
 const MARKER_CANCEL_BREAK = "MARS_DEMO_ERROR_LOG";
 const MARKER_BURN_CPU = "MARS_DEMO_BURN_CPU";
 const MARKER_BURN_MEM = "MARS_DEMO_BURN_MEM";
+const MARKER_OOM = "MARS_DEMO_OOM";
 
 let requestCount = 0;
 let inflight = 0;
@@ -225,20 +240,28 @@ async function handleHealth(_req, res) {
       saturated_total: saturatedTotal,
       cpu_burns_active: cpuBurnsActive,
       mem_burns_active: memBurnsActive,
-      burn_caps: {
-        cpu_max_ms: BURN_CPU_MAX_MS,
-        cpu_default_ms: BURN_CPU_DEFAULT_MS,
-        cpu_default_duty: BURN_CPU_DEFAULT_DUTY,
-        cpu_default_slice_ms: BURN_CPU_DEFAULT_SLICE_MS,
-        cpu_max_busy_ms: BURN_CPU_MAX_BUSY_MS,
-        mem_max_mb: BURN_MEM_MAX_MB,
-        mem_max_hold_ms: BURN_MEM_MAX_HOLD_MS,
-      },
+      burn_caps: (() => {
+        const lim = detectMemLimitMb();
+        return {
+          cpu_max_ms: BURN_CPU_MAX_MS,
+          cpu_default_ms: BURN_CPU_DEFAULT_MS,
+          cpu_default_duty: BURN_CPU_DEFAULT_DUTY,
+          cpu_default_slice_ms: BURN_CPU_DEFAULT_SLICE_MS,
+          cpu_max_busy_ms: BURN_CPU_MAX_BUSY_MS,
+          mem_default_hold_ms: BURN_MEM_DEFAULT_HOLD_MS,
+          mem_max_hold_ms: BURN_MEM_MAX_HOLD_MS,
+          mem_target_pct: BURN_MEM_DEFAULT_TARGET_PCT,
+          mem_chunk_mb: BURN_MEM_CHUNK_MB,
+          mem_limit_mb: lim.limit_mb,
+          mem_limit_source: lim.source,
+        };
+      })(),
       log_markers: {
         five_xx: MARKER_5XX,
         slow: MARKER_SLOW,
         burn_cpu: MARKER_BURN_CPU,
         burn_mem: MARKER_BURN_MEM,
+        oom: MARKER_OOM,
       },
     },
   });
@@ -419,6 +442,52 @@ function rssMb() {
 }
 
 /**
+ * Resolve instance memory limit (MiB).
+ * Order: DEMO_MEM_LIMIT_MB / DEMO_BURN_MEM_LIMIT_MB → cgroup v2/v1 →
+ * NODE_OPTIONS --max-old-space-size (heap hint only) → 512 (apps-s-1vcpu-0.5gb).
+ */
+function detectMemLimitMb() {
+  const fromEnv = Number(process.env.DEMO_MEM_LIMIT_MB || process.env.DEMO_BURN_MEM_LIMIT_MB || 0);
+  if (Number.isFinite(fromEnv) && fromEnv >= 64) {
+    return { limit_mb: Math.floor(fromEnv), source: "env" };
+  }
+
+  const cgroupPaths = [
+    "/sys/fs/cgroup/memory.max", // v2
+    "/sys/fs/cgroup/memory/memory.limit_in_bytes", // v1
+  ];
+  for (const path of cgroupPaths) {
+    try {
+      const raw = fs.readFileSync(path, "utf8").trim();
+      if (!raw || raw === "max") continue;
+      const bytes = Number(raw);
+      // Ignore absurd unrestricted v1 sentinels (~2^63).
+      if (!Number.isFinite(bytes) || bytes <= 0 || bytes > 1e15) continue;
+      const mb = Math.floor(bytes / (1024 * 1024));
+      if (mb >= 64) {
+        return {
+          limit_mb: mb,
+          source: path.includes("memory.max") ? "cgroup_v2" : "cgroup_v1",
+        };
+      }
+    } catch {
+      /* not in a cgroup or unreadable */
+    }
+  }
+
+  const nodeOpts = process.env.NODE_OPTIONS || "";
+  const m = nodeOpts.match(/--max-old-space-size=(\d+)/i);
+  if (m) {
+    const mb = Number(m[1]);
+    if (Number.isFinite(mb) && mb >= 64) {
+      return { limit_mb: Math.floor(mb), source: "node_options_max_old_space" };
+    }
+  }
+
+  return { limit_mb: BURN_MEM_LIMIT_FALLBACK_MB, source: "fallback_512" };
+}
+
+/**
  * Short busy bursts on the event loop, then yield via setTimeout.
  * Defaults (~4ms busy / ~8ms yield @ duty 0.35 / slice 12) keep health+API
  * answering while average CPU stays elevated for a ~60–90s Insights window.
@@ -484,11 +553,23 @@ async function handleBurnCpu(req, res, url) {
     100
   );
 
+  const allowStack =
+    body.allow_stack === true ||
+    url.searchParams.get("allow_stack") === "1" ||
+    url.searchParams.get("allow_stack") === "true";
+
   if (cpuBurnsActive >= 1) {
     return json(res, 429, {
       error: "cpu burn already in progress",
       cpu_burns_active: cpuBurnsActive,
-      hint: "wait for the current burn to finish (only one sustained burn at a time)",
+      hint: "wait for the current burn to finish (only one sustained CPU burn at a time)",
+    });
+  }
+  if (memBurnsActive >= 1 && !allowStack) {
+    return json(res, 429, {
+      error: "memory burn in progress — refuse stacking CPU+mem on small instances",
+      mem_burns_active: memBurnsActive,
+      hint: "wait for mem burn to end, or pass allow_stack:true (OOM risk on 0.5GiB)",
     });
   }
 
@@ -563,79 +644,127 @@ async function handleBurnCpu(req, res, url) {
 }
 
 /**
- * Allocate+touch memory in chunks, retain globally for hold_ms, then release.
- * Returns 202 after allocation so long holds are not cut by gateway timeouts.
+ * Touch pages so RSS grows (allocUnsafe is uninitialized).
  */
-function allocateRetainedMemory(mb) {
-  const chunkMb = 32;
+function touchBuffer(buf) {
+  for (let i = 0; i < buf.length; i += 4096) buf[i] = 0xaa;
+  if (buf.length) buf[buf.length - 1] = 0x55;
+}
+
+/**
+ * Grow retained buffers until process RSS reaches targetRssMb (never past it).
+ * Yields between chunks so health/API can run during the climb.
+ */
+async function growRssTowardTarget(targetRssMb, chunkMb) {
   const chunks = [];
-  let allocated = 0;
-  while (allocated < mb) {
-    const thisMb = Math.min(chunkMb, mb - allocated);
+  let allocatedMb = 0;
+  let rss = rssMb();
+  while (rss < targetRssMb) {
+    const remaining = targetRssMb - rss;
+    // Never round up — stop when less than 1 MiB of headroom remains.
+    const thisMb = Math.min(chunkMb, Math.floor(remaining));
+    if (thisMb < 1) break;
     const buf = Buffer.allocUnsafe(thisMb * 1024 * 1024);
-    // Force physical pages into RSS (allocUnsafe is uninitialized).
-    for (let i = 0; i < buf.length; i += 4096) buf[i] = 0xaa;
-    buf[buf.length - 1] = 0x55;
+    touchBuffer(buf);
     chunks.push(buf);
-    allocated += thisMb;
+    retainedMemChunks.push(buf);
+    allocatedMb += thisMb;
+    rss = rssMb();
+    // If this chunk overshot (accounting lag), stop — do not allocate more.
+    if (rss >= targetRssMb) break;
+    await new Promise((resolve) => setImmediate(resolve));
+    rss = rssMb();
   }
-  return chunks;
+  return { chunks, allocatedMb, rss_mb: rssMb() };
 }
 
 /**
  * POST/GET /api/demo/burn-memory
- * Params: mb (default 380), hold_ms (default 60000). Hard-capped by env.
+ * Grow RSS toward target_pct (default 0.9) of the instance memory limit, hold hold_ms.
+ * Params: target_pct, hold_ms. Optional legacy `mb` ignored for sizing (logged if present).
+ * Single active mem burn only (429 on second click).
  */
 async function handleBurnMemory(req, res, url) {
   const body = req.method === "POST" ? await readJson(req) : {};
-  const mb = clampInt(
-    body.mb ?? url.searchParams.get("mb"),
-    BURN_MEM_DEFAULT_MB,
-    1,
-    BURN_MEM_MAX_MB
-  );
   const holdMs = clampInt(
     body.hold_ms ?? url.searchParams.get("hold_ms"),
     BURN_MEM_DEFAULT_HOLD_MS,
     100,
     BURN_MEM_MAX_HOLD_MS
   );
+  const targetPct = clampFloat(
+    body.target_pct ?? url.searchParams.get("target_pct"),
+    BURN_MEM_DEFAULT_TARGET_PCT,
+    0.5,
+    0.95
+  );
+  const allowStack =
+    body.allow_stack === true ||
+    url.searchParams.get("allow_stack") === "1" ||
+    url.searchParams.get("allow_stack") === "true";
 
-  if (memBurnsActive >= 2) {
+  if (memBurnsActive >= 1) {
     return json(res, 429, {
       error: "memory burn already in progress",
       mem_burns_active: memBurnsActive,
-      hint: "wait for the current burn to finish",
+      hint: "Do not double-click — wait for hold_ms to end. A second retain OOMs 0.5GiB (exit 128 → gateway 504s while restarting)",
+    });
+  }
+  if (cpuBurnsActive >= 1 && !allowStack) {
+    return json(res, 429, {
+      error: "cpu burn in progress — refuse stacking CPU+mem on small instances",
+      cpu_burns_active: cpuBurnsActive,
+      hint: "wait for CPU burn to end, or pass allow_stack:true (OOM risk on 0.5GiB)",
+    });
+  }
+
+  const { limit_mb: limitMb, source: limitSource } = detectMemLimitMb();
+  const targetRssMb = Math.floor(limitMb * targetPct);
+  const rssBefore = rssMb();
+
+  if (rssBefore >= targetRssMb) {
+    return json(res, 409, {
+      error: "RSS already at or above target — no-op",
+      rss_mb: rssBefore,
+      target_rss_mb: targetRssMb,
+      target_pct: targetPct,
+      limit_mb: limitMb,
+      limit_source: limitSource,
+      hint: "Process is already near the burn target; wait for GC/release or lower target_pct",
     });
   }
 
   memBurnsActive += 1;
   const started = Date.now();
-  const rssBefore = rssMb();
   console.error(
     JSON.stringify({
       marker: MARKER_BURN_MEM,
       event: "start",
-      mb,
+      target_pct: targetPct,
+      limit_mb: limitMb,
+      limit_source: limitSource,
+      target_rss_mb: targetRssMb,
       hold_ms: holdMs,
-      rss_mb: rssBefore,
-      mode: "background",
-      caps: { max_mb: BURN_MEM_MAX_MB, max_hold_ms: BURN_MEM_MAX_HOLD_MS },
-      warning: "High mb can OOM/restart a small App Platform instance",
+      rss_mb_before: rssBefore,
+      chunk_mb: BURN_MEM_CHUNK_MB,
+      legacy_mb_ignored: body.mb ?? url.searchParams.get("mb") ?? null,
+      mode: "grow_to_target_pct",
+      warning:
+        "Exit 128 after BURN_MEM = cgroup OOM kill (unloggable SIGKILL); gateway 504s until restart",
     })
   );
 
-  let chunks;
+  let grow;
   try {
-    chunks = allocateRetainedMemory(mb);
-    retainedMemChunks.push(...chunks);
+    grow = await growRssTowardTarget(targetRssMb, BURN_MEM_CHUNK_MB);
   } catch (err) {
     memBurnsActive -= 1;
     console.error(
       JSON.stringify({
         marker: MARKER_BURN_MEM,
         event: "error",
-        mb,
+        target_pct: targetPct,
+        limit_mb: limitMb,
         error: err.message,
         rss_mb: rssMb(),
       })
@@ -647,13 +776,15 @@ async function handleBurnMemory(req, res, url) {
         error: err.message || "memory burn failed",
         marker: MARKER_BURN_MEM,
         rss_mb: rssMb(),
-        hint: "Allocation failed — lower mb (instance may be near its memory cap)",
+        limit_mb: limitMb,
+        hint: "Allocation failed — instance may be near its memory cap",
       },
       { skipFiveXxLog: true }
     );
   }
 
-  const rssAfterAlloc = rssMb();
+  const rssAfterAlloc = grow.rss_mb;
+  const chunks = grow.chunks;
   setTimeout(() => {
     for (const buf of chunks) {
       const idx = retainedMemChunks.indexOf(buf);
@@ -665,10 +796,15 @@ async function handleBurnMemory(req, res, url) {
       JSON.stringify({
         marker: MARKER_BURN_MEM,
         event: "end",
-        mb,
+        target_pct: targetPct,
+        limit_mb: limitMb,
+        limit_source: limitSource,
+        target_rss_mb: targetRssMb,
         hold_ms: holdMs,
+        allocated_mb: grow.allocatedMb,
         took_ms: Date.now() - started,
-        rss_mb: rssMb(),
+        rss_mb_before: rssBefore,
+        rss_mb_after: rssMb(),
         retained_chunks: retainedMemChunks.length,
       })
     );
@@ -678,14 +814,19 @@ async function handleBurnMemory(req, res, url) {
     ok: true,
     accepted: true,
     burn: "memory",
-    mb,
+    mode: "grow_to_target_pct",
+    target_pct: targetPct,
+    limit_mb: limitMb,
+    limit_source: limitSource,
+    target_rss_mb: targetRssMb,
     hold_ms: holdMs,
+    allocated_mb: grow.allocatedMb,
     marker: MARKER_BURN_MEM,
     rss_mb_before: rssBefore,
     rss_mb_after_alloc: rssAfterAlloc,
     retained_chunks: retainedMemChunks.length,
     note:
-      "Memory retained in-process for hold_ms — watch Insights memory; logs emit MARS_DEMO_BURN_MEM start/end",
+      "Grew RSS toward ~target_pct of instance limit and holding — headroom left for HTTP; do not double-click",
   });
 }
 
@@ -746,10 +887,29 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+// SIGKILL (cgroup OOM → exit 128) cannot be caught. Log what we can on graceful stops.
+for (const sig of ["SIGTERM", "SIGINT"]) {
+  process.on(sig, () => {
+    console.error(
+      JSON.stringify({
+        marker: MARKER_OOM,
+        level: "warn",
+        event: "process_signal",
+        signal: sig,
+        rss_mb: rssMb(),
+        cpu_burns_active: cpuBurnsActive,
+        mem_burns_active: memBurnsActive,
+        note: "Graceful signal — if App Platform logged exit 128 right after BURN_MEM, that was OOM/SIGKILL (unloggable); gateway 504s until the new process listens",
+      })
+    );
+    process.exit(0);
+  });
+}
+
 server.listen(PORT, () => {
   console.log(`mars-demo-api listening on :${PORT}`);
   console.log(
-    `demo knobs: DELAY_MS=${HANDLER_DELAY_MS} MAX_INFLIGHT=${MAX_INFLIGHT || "unlimited"} PG_POOL_MAX=${PG_POOL_MAX}`
+    `demo knobs: DELAY_MS=${HANDLER_DELAY_MS} MAX_INFLIGHT=${MAX_INFLIGHT || "unlimited"} PG_POOL_MAX=${PG_POOL_MAX} MEM_TARGET_PCT=${BURN_MEM_DEFAULT_TARGET_PCT} MEM_LIMIT_FALLBACK_MB=${BURN_MEM_LIMIT_FALLBACK_MB}`
   );
   if (!DATABASE_URL) {
     console.warn("DATABASE_URL is not set; DB routes will return 503");
