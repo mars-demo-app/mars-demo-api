@@ -10,13 +10,28 @@ const CRASH_AFTER = Number(process.env.DEMO_CRASH_AFTER_REQUESTS || 0);
 
 let requestCount = 0;
 
-const pool = DATABASE_URL
-  ? new Pool({
-      connectionString: DATABASE_URL,
-      ssl: process.env.PGSSL === "disable" ? false : { rejectUnauthorized: false },
-      max: 5,
-    })
-  : null;
+function pgPoolConfig(url) {
+  if (process.env.PGSSL === "disable") {
+    return { connectionString: url, ssl: false, max: 5 };
+  }
+  // DO managed PG URLs include sslmode=require; pg v8 treats that as verify-full.
+  let cleaned = url;
+  try {
+    const u = new URL(url);
+    u.searchParams.delete("sslmode");
+    u.searchParams.delete("uselibpqcompat");
+    cleaned = u.toString();
+  } catch {
+    cleaned = url;
+  }
+  return {
+    connectionString: cleaned,
+    ssl: { rejectUnauthorized: false },
+    max: 5,
+  };
+}
+
+const pool = DATABASE_URL ? new Pool(pgPoolConfig(DATABASE_URL)) : null;
 
 function json(res, status, body) {
   const payload = JSON.stringify(body);
