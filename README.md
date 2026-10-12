@@ -58,11 +58,11 @@ Defaults are safe for normal browsing (no artificial delay, unlimited inflight).
 
 Returns **202 Accepted** and burns in the background.
 
-**CPU** uses a **duty-cycled** busy/yield loop on the event loop (`duty_cycle` × `slice_ms` busy, then yield). That keeps HTTP/health responsive on a **1 vCPU** instance while holding elevated average CPU for 60–90s (graph-friendly). Hard worker-thread pegging is intentionally gone — it caused gateway **504**s while Insights averages still looked low.
+**CPU** uses a **duty-cycled** single worker (busy then Atomics.wait sleep) (`duty_cycle` × `slice_ms` busy, then yield). That keeps HTTP/health responsive on a **1 vCPU** instance while holding elevated average CPU for 60–90s (graph-friendly). Hard worker-thread pegging is intentionally gone — it caused gateway **504**s while Insights averages still looked low.
 
 | Endpoint | Defaults | Max / notes |
 | --- | --- | --- |
-| `/api/demo/burn-cpu` | `duration_ms=90000`, `duty_cycle=0.7`, `slice_ms=40` | duration max 180s; duty 0.1–0.95 |
+| `/api/demo/burn-cpu` | `duration_ms=90000`, `duty_cycle=0.7`, `slice_ms=50` | duration max 180s; duty 0.1–0.95 |
 | `/api/demo/burn-memory` | `mb=380`, `hold_ms=60000` | 450 MB / 180s |
 
 ```bash

@@ -324,6 +324,236 @@ async function handleCancelOrder(req, res) {
   });
 }
 
+async function handleSeedOrders(req, res) {
+  if (!pool) return json(res, 503, { error: "DATABASE_URL not configured" });
+  const body = await readJson(req);
+  if (body.confirm !== "seed") {
+    return json(res, 400, {
+      error: 'body must include confirm: "seed"',
+      example: { confirm: "seed", count: 80000, hotpath_extra: 200 },
+    });
+  }
+  const count = Math.min(
+    SEED_MAX,
+    Math.max(0, Math.floor(Number(body.count || 80_000)))
+  );
+  const hotpathExtra = Math.min(
+    5_000,
+    Math.max(0, Math.floor(Number(body.hotpath_extra || 200)))
+  );
+  const hotpath = String(body.hotpath_email || "hotpath@example.com")
+    .trim()
+    .toLowerCase();
+
+  // Seed is intentionally outside withDemoLoad so scale knobs don't block prep.
+  const started = Date.now();
+  const before = await pool.query("SELECT COUNT(*)::bigint AS n FROM orders");
+  await pool.query(
+    `INSERT INTO orders (customer_email, amount_cents, status)
+     SELECT
+       'bulk-' || g::text || '@example.com',
+       500 + (g % 5000),
+       'created'
+     FROM generate_series(1, $1) AS g`,
+    [count]
+  );
+  if (hotpathExtra > 0) {
+    await pool.query(
+      `INSERT INTO orders (customer_email, amount_cents, status)
+       SELECT $1, 2500 + (g % 100), 'created'
+       FROM generate_series(1, $2) AS g`,
+      [hotpath, hotpathExtra]
+    );
+  }
+  const after = await pool.query("SELECT COUNT(*)::bigint AS n FROM orders");
+  const took_ms = Date.now() - started;
+  maybeLogSlow(res, took_ms, {
+    kind: "seed-orders",
+    inserted_bulk: count,
+    orders_after: Number(after.rows[0].n),
+  });
+  json(res, 200, {
+    inserted_bulk: count,
+    inserted_hotpath: hotpathExtra,
+    hotpath_email: hotpath,
+    orders_before: Number(before.rows[0].n),
+    orders_after: Number(after.rows[0].n),
+    took_ms,
+    reminder: "No index on customer_email — use Hammer lookups next",
+  });
+}
+
+function clampInt(raw, fallback, min, max) {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, Math.floor(n)));
+}
+
+function clampFloat(raw, fallback, min, max) {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+}
+
+function rssMb() {
+  return Math.round((process.memoryUsage().rss / (1024 * 1024)) * 10) / 10;
+}
+
+/**
+ * One worker: busy-spin for duty*slice, then Atomics.wait sleep. The HTTP
+ * event loop never runs the busy work, so health/API stay responsive on 1 vCPU
+ * while process CPU averages near the duty cycle for duration_ms.
+ */
+function runDutyCycleWorker(durationMs, dutyCycle, sliceMs) {
+  const source = `
+    const { parentPort, workerData } = require("node:worker_threads");
+    const { durationMs, dutyCycle, sliceMs } = workerData;
+    const end = Date.now() + durationMs;
+    let ops = 0;
+    let slices = 0;
+    let x = 0x12345678;
+    const sab = new SharedArrayBuffer(4);
+    const ia = new Int32Array(sab);
+    while (Date.now() < end) {
+      const workMs = Math.max(1, Math.floor(sliceMs * dutyCycle));
+      const pauseMs = Math.max(1, sliceMs - workMs);
+      const sliceEnd = Date.now() + workMs;
+      while (Date.now() < sliceEnd) {
+        for (let i = 0; i < 10_000; i++) {
+          x = Math.imul(x, 1664525) + 1013904223;
+        }
+        ops += 10_000;
+      }
+      slices += 1;
+      Atomics.wait(ia, 0, 0, pauseMs);
+    }
+    parentPort.postMessage({ ok: true, ops, slices, x });
+  `;
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(source, {
+      eval: true,
+      workerData: { durationMs, dutyCycle, sliceMs },
+    });
+    let settled = false;
+    worker.on("message", (msg) => {
+      settled = true;
+      resolve(msg);
+    });
+    worker.on("error", (err) => {
+      settled = true;
+      reject(err);
+    });
+    worker.on("exit", (code) => {
+      if (!settled && code !== 0) {
+        reject(new Error(`cpu duty worker exited with code ${code}`));
+      }
+    });
+  });
+}
+
+/**
+ * POST/GET /api/demo/burn-cpu
+ * Starts one background duty-cycled worker; returns 202 immediately.
+ * Params: duration_ms (default 90000), duty_cycle (default 0.7), slice_ms (default 50).
+ * Legacy `workers` is ignored (multi hard-workers caused 504s on 1 vCPU).
+ */
+async function handleBurnCpu(req, res, url) {
+  const body = req.method === "POST" ? await readJson(req) : {};
+  const durationMs = clampInt(
+    body.duration_ms ?? url.searchParams.get("duration_ms"),
+    BURN_CPU_DEFAULT_MS,
+    100,
+    BURN_CPU_MAX_MS
+  );
+  const dutyCycle = clampFloat(
+    body.duty_cycle ?? url.searchParams.get("duty_cycle"),
+    BURN_CPU_DEFAULT_DUTY,
+    0.1,
+    0.95
+  );
+  const sliceMs = clampInt(
+    body.slice_ms ?? url.searchParams.get("slice_ms"),
+    BURN_CPU_DEFAULT_SLICE_MS,
+    5,
+    200
+  );
+
+  if (cpuBurnsActive >= 1) {
+    return json(res, 429, {
+      error: "cpu burn already in progress",
+      cpu_burns_active: cpuBurnsActive,
+      hint: "wait for the current burn to finish (only one sustained burn at a time)",
+    });
+  }
+
+  cpuBurnsActive += 1;
+  const started = Date.now();
+  const workMs = Math.floor(sliceMs * dutyCycle);
+  const yieldMs = Math.max(1, sliceMs - workMs);
+  console.error(
+    JSON.stringify({
+      marker: MARKER_BURN_CPU,
+      event: "start",
+      duration_ms: durationMs,
+      duty_cycle: dutyCycle,
+      slice_ms: sliceMs,
+      work_ms_per_slice: workMs,
+      yield_ms_per_slice: yieldMs,
+      mode: "duty_cycle_worker",
+      workers: 1,
+      rss_mb: rssMb(),
+      caps: { max_ms: BURN_CPU_MAX_MS },
+      note: "single worker busy/sleep; HTTP event loop stays free",
+    })
+  );
+
+  runDutyCycleWorker(durationMs, dutyCycle, sliceMs)
+    .then((result) => {
+      console.error(
+        JSON.stringify({
+          marker: MARKER_BURN_CPU,
+          event: "end",
+          duration_ms: durationMs,
+          duty_cycle: dutyCycle,
+          slice_ms: sliceMs,
+          took_ms: Date.now() - started,
+          ops: result.ops,
+          slices: result.slices,
+          rss_mb: rssMb(),
+        })
+      );
+    })
+    .catch((err) => {
+      console.error(
+        JSON.stringify({
+          marker: MARKER_BURN_CPU,
+          event: "error",
+          error: err.message,
+          rss_mb: rssMb(),
+        })
+      );
+    })
+    .finally(() => {
+      cpuBurnsActive -= 1;
+    });
+
+  return json(res, 202, {
+    ok: true,
+    accepted: true,
+    burn: "cpu",
+    mode: "duty_cycle_worker",
+    duration_ms: durationMs,
+    duty_cycle: dutyCycle,
+    slice_ms: sliceMs,
+    work_ms_per_slice: workMs,
+    yield_ms_per_slice: yieldMs,
+    workers: 1,
+    marker: MARKER_BURN_CPU,
+    rss_mb: rssMb(),
+    note:
+      "Single duty-cycled worker (busy then sleep) — HTTP stays free; watch Insights CPU over ~duration_ms",
+  });
+}
 
 /**
  * Allocate+touch memory in chunks, retain globally for hold_ms, then release.
