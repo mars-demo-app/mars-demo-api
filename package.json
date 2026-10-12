@@ -1,0 +1,17 @@
+{
+  "name": "mars-demo-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Backend service for the Mars Demo Shop on DigitalOcean App Platform",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "pg": "^8.16.3"
+  }
+}
