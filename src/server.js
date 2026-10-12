@@ -289,7 +289,8 @@ async function handleLookupByEmail(req, res, url) {
   });
 }
 
-// Soft-cancel: set status to 'cancelled'. Idempotent if already cancelled.
+// DEMO BREAK: cancel looks wired but fails with a searchable marker in logs.
+// Process stays up (HTTP 500 only) so App Platform keeps serving other routes.
 async function handleCancelOrder(req, res) {
   if (!pool) return json(res, 503, { error: "DATABASE_URL not configured" });
   const body = await readJson(req);
@@ -299,27 +300,42 @@ async function handleCancelOrder(req, res) {
   }
 
   return withDemoLoad(res, async () => {
-    const existing = await pool.query(
-      `SELECT id, customer_email, amount_cents, status, created_at
-       FROM orders WHERE id = $1`,
-      [Math.floor(id)]
-    );
-    if (!existing.rowCount) {
-      return json(res, 404, { error: "order not found", id: Math.floor(id) });
+    const orderId = Math.floor(id);
+    // Intentional bug: wrong column name — cancel never lands, request fails.
+    try {
+      await pool.query(
+        `UPDATE orders SET order_status = 'cancelled' WHERE id = $1`,
+        [orderId]
+      );
+    } catch (err) {
+      console.error(
+        JSON.stringify({
+          marker: "MARS_DEMO_ERROR_LOG",
+          event: "cancel_order_failed",
+          order_id: orderId,
+          error: err.message,
+          hint: "search App Platform runtime logs for MARS_DEMO_ERROR_LOG",
+        })
+      );
+      return json(res, 500, {
+        error: "cancel order failed",
+        order_id: orderId,
+        marker: "MARS_DEMO_ERROR_LOG",
+      });
     }
-    const order = existing.rows[0];
-    if (order.status === "cancelled") {
-      return json(res, 200, { order, already_cancelled: true });
-    }
-
-    const { rows } = await pool.query(
-      `UPDATE orders SET status = 'cancelled'
-       WHERE id = $1
-       RETURNING id, customer_email, amount_cents, status, created_at`,
-      [Math.floor(id)]
+    // Unreachable on DO PG (column missing); keep a hard fail if the schema ever matches.
+    console.error(
+      JSON.stringify({
+        marker: "MARS_DEMO_ERROR_LOG",
+        event: "cancel_order_unexpected_success",
+        order_id: orderId,
+      })
     );
-    maybeCrashAfterSuccess();
-    json(res, 200, { order: rows[0], already_cancelled: false });
+    return json(res, 500, {
+      error: "cancel order failed",
+      order_id: orderId,
+      marker: "MARS_DEMO_ERROR_LOG",
+    });
   });
 }
 
