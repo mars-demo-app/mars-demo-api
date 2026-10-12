@@ -23,5 +23,5 @@ jobs:
             exit 0
           fi
           gh workflow run compose-app-spec.yml \
-            --repo hugocorbucci/mars-demo-app \
+            --repo mars-demo-app/mars-demo-app \
             -f reason="mars-demo-api@${GITHUB_SHA}"

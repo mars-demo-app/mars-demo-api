@@ -3,7 +3,7 @@
 services:
   - name: api
     github:
-      repo: hugocorbucci/mars-demo-api
+      repo: mars-demo-app/mars-demo-api
       branch: main
       deploy_on_push: true
     environment_slug: node-js
