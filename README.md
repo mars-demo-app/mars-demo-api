@@ -17,26 +17,45 @@ Backend HTTP service for the **Mars Demo Shop** on DigitalOcean App Platform.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/api/health` (or `/health`) | Liveness + DB ping |
+| `GET` | `/api/health` (or `/health`) | Liveness + DB ping + demo knobs |
 | `GET` | `/api/orders` | Recent orders |
 | `POST` | `/api/orders` | Create order `{ customer_email, amount_cents }` |
 | `POST` | `/api/orders/cancel` | Soft-cancel order `{ id }` → `status: cancelled` |
-| `GET` | `/api/orders/by-email?email=` | Unindexed lookup (latent-bug demo path) |
+| `GET` | `/api/orders/by-email?email=` | Unindexed lookup (latent-bug / congestion path) |
+| `POST` | `/api/demo/seed-orders` | Bulk insert for congestion demo (`confirm: "seed"`) |
 
 ## Local run
 
 ```bash
 npm install
-export DATABASE_URL='postgres://postgres:postgres@127.0.0.1:5432/mars_demo'
+export DATABASE_URL='postgres://mars:mars@127.0.0.1:5432/mars_demo'
 export PGSSL=disable
 # Apply schema from mars-demo-db first, then:
 npm start
 # http://127.0.0.1:8080/health
 ```
 
-## Demo knobs
+## Demo knobs (env)
 
-- `DEMO_CRASH_AFTER_REQUESTS` — if set to a positive integer, the process exits after that many successful mutating/read demo requests (bad-deploy scenario for MARS).
+Defaults are safe for normal browsing (no artificial delay, unlimited inflight).
+
+| Env | Default | Purpose |
+| --- | --- | --- |
+| `DEMO_CRASH_AFTER_REQUESTS` | `0` | Exit after N successful demo requests (bad deploy) |
+| `DEMO_HANDLER_DELAY_MS` | `0` | Artificial delay on non-health handlers (scale demo) |
+| `DEMO_MAX_INFLIGHT` | `0` | Cap concurrent non-health handlers; `0` = unlimited. Over cap → HTTP 503 |
+| `DEMO_PG_POOL_MAX` | `5` | pg pool size (small → connection wait under hammer) |
+
+### Suggested App Platform values for scale demo (mode C)
+
+Set on component `api` (Runtime), then redeploy / wait for config apply:
+
+```text
+DEMO_HANDLER_DELAY_MS=800
+DEMO_MAX_INFLIGHT=4
+```
+
+Then use UI **API load test** (or `make stress-api`). Remediation: raise `api` **instance_count** (e.g. 1 → 2+) in App Platform.
 
 ## App Platform fragment
 

@@ -7,12 +7,27 @@ const { Pool } = require("pg");
 const PORT = Number(process.env.PORT || 8080);
 const DATABASE_URL = process.env.DATABASE_URL;
 const CRASH_AFTER = Number(process.env.DEMO_CRASH_AFTER_REQUESTS || 0);
+/** Artificial per-request delay for scale demos. 0 = off (safe default). */
+const HANDLER_DELAY_MS = Math.max(0, Number(process.env.DEMO_HANDLER_DELAY_MS || 0) || 0);
+/** Cap concurrent in-flight non-health handlers. 0 = unlimited (safe default). */
+const MAX_INFLIGHT = Math.max(0, Number(process.env.DEMO_MAX_INFLIGHT || 0) || 0);
+/** pg pool size; keep small so unindexed hammers show connection wait. */
+const PG_POOL_MAX = Math.max(1, Number(process.env.DEMO_PG_POOL_MAX || 5) || 5);
+/** Hard cap for one-click seed endpoint. */
+const SEED_MAX = 200_000;
 
 let requestCount = 0;
+let inflight = 0;
+let peakInflight = 0;
+let saturatedTotal = 0;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function pgPoolConfig(url) {
   if (process.env.PGSSL === "disable") {
-    return { connectionString: url, ssl: false, max: 5 };
+    return { connectionString: url, ssl: false, max: PG_POOL_MAX };
   }
   // DO managed PG URLs include sslmode=require; pg v8 treats that as verify-full.
   let cleaned = url;
@@ -27,7 +42,7 @@ function pgPoolConfig(url) {
   return {
     connectionString: cleaned,
     ssl: { rejectUnauthorized: false },
-    max: 5,
+    max: PG_POOL_MAX,
   };
 }
 
@@ -60,12 +75,36 @@ async function readJson(req) {
   return JSON.parse(Buffer.concat(chunks).toString("utf8"));
 }
 
+/** Apply delay + inflight gate. Health bypasses this. */
+async function withDemoLoad(res, work) {
+  if (MAX_INFLIGHT > 0 && inflight >= MAX_INFLIGHT) {
+    saturatedTotal += 1;
+    return json(res, 503, {
+      error: "api saturated",
+      demo_max_inflight: MAX_INFLIGHT,
+      inflight,
+      hint: "Scale the api component instance_count (or raise DEMO_MAX_INFLIGHT / lower DEMO_HANDLER_DELAY_MS)",
+    });
+  }
+  inflight += 1;
+  if (inflight > peakInflight) peakInflight = inflight;
+  try {
+    if (HANDLER_DELAY_MS > 0) await sleep(HANDLER_DELAY_MS);
+    return await work();
+  } finally {
+    inflight -= 1;
+  }
+}
+
 async function handleHealth(_req, res) {
   let db = "skipped";
+  let orderCount = null;
   if (pool) {
     try {
       await pool.query("SELECT 1");
       db = "ok";
+      const count = await pool.query("SELECT COUNT(*)::bigint AS n FROM orders");
+      orderCount = Number(count.rows[0].n);
     } catch (err) {
       db = `error: ${err.message}`;
       return json(res, 503, { ok: false, db, service: "mars-demo-api" });
@@ -75,21 +114,32 @@ async function handleHealth(_req, res) {
     ok: true,
     service: "mars-demo-api",
     db,
+    order_count: orderCount,
     crash_after_requests: CRASH_AFTER || null,
     requests_seen: requestCount,
+    demo: {
+      handler_delay_ms: HANDLER_DELAY_MS,
+      max_inflight: MAX_INFLIGHT || null,
+      pg_pool_max: PG_POOL_MAX,
+      inflight,
+      peak_inflight: peakInflight,
+      saturated_total: saturatedTotal,
+    },
   });
 }
 
 async function handleListOrders(_req, res) {
   if (!pool) return json(res, 503, { error: "DATABASE_URL not configured" });
-  const { rows } = await pool.query(
-    `SELECT id, customer_email, amount_cents, status, created_at
-     FROM orders
-     ORDER BY created_at DESC
-     LIMIT 25`
-  );
-  maybeCrashAfterSuccess();
-  json(res, 200, { orders: rows });
+  return withDemoLoad(res, async () => {
+    const { rows } = await pool.query(
+      `SELECT id, customer_email, amount_cents, status, created_at
+       FROM orders
+       ORDER BY created_at DESC
+       LIMIT 25`
+    );
+    maybeCrashAfterSuccess();
+    json(res, 200, { orders: rows });
+  });
 }
 
 async function handleCreateOrder(req, res) {
@@ -100,14 +150,16 @@ async function handleCreateOrder(req, res) {
   if (!email || !email.includes("@") || !Number.isFinite(amount) || amount <= 0) {
     return json(res, 400, { error: "customer_email and positive amount_cents are required" });
   }
-  const { rows } = await pool.query(
-    `INSERT INTO orders (customer_email, amount_cents, status)
-     VALUES ($1, $2, 'created')
-     RETURNING id, customer_email, amount_cents, status, created_at`,
-    [email, Math.floor(amount)]
-  );
-  maybeCrashAfterSuccess();
-  json(res, 201, rows[0]);
+  return withDemoLoad(res, async () => {
+    const { rows } = await pool.query(
+      `INSERT INTO orders (customer_email, amount_cents, status)
+       VALUES ($1, $2, 'created')
+       RETURNING id, customer_email, amount_cents, status, created_at`,
+      [email, Math.floor(amount)]
+    );
+    maybeCrashAfterSuccess();
+    json(res, 201, rows[0]);
+  });
 }
 
 async function handleLookupByEmail(req, res, url) {
@@ -116,17 +168,24 @@ async function handleLookupByEmail(req, res, url) {
   if (!email) return json(res, 400, { error: "email query param required" });
 
   // Latent bug path: filter on customer_email without a supporting index (see mars-demo-db).
-  const started = Date.now();
-  const { rows } = await pool.query(
-    `SELECT id, customer_email, amount_cents, status, created_at
-     FROM orders
-     WHERE customer_email = $1
-     ORDER BY created_at DESC
-     LIMIT 50`,
-    [email]
-  );
-  maybeCrashAfterSuccess();
-  json(res, 200, { email, took_ms: Date.now() - started, orders: rows });
+  return withDemoLoad(res, async () => {
+    const started = Date.now();
+    const { rows } = await pool.query(
+      `SELECT id, customer_email, amount_cents, status, created_at
+       FROM orders
+       WHERE customer_email = $1
+       ORDER BY created_at DESC
+       LIMIT 50`,
+      [email]
+    );
+    maybeCrashAfterSuccess();
+    json(res, 200, {
+      email,
+      took_ms: Date.now() - started,
+      orders: rows,
+      note: "customer_email has no index on main — concurrent hammers congest the DB",
+    });
+  });
 }
 
 // Soft-cancel: set status to 'cancelled'. Idempotent if already cancelled.
@@ -138,27 +197,86 @@ async function handleCancelOrder(req, res) {
     return json(res, 400, { error: "positive numeric id is required" });
   }
 
-  const existing = await pool.query(
-    `SELECT id, customer_email, amount_cents, status, created_at
-     FROM orders WHERE id = $1`,
-    [Math.floor(id)]
-  );
-  if (!existing.rowCount) {
-    return json(res, 404, { error: "order not found", id: Math.floor(id) });
-  }
-  const order = existing.rows[0];
-  if (order.status === "cancelled") {
-    return json(res, 200, { order, already_cancelled: true });
-  }
+  return withDemoLoad(res, async () => {
+    const existing = await pool.query(
+      `SELECT id, customer_email, amount_cents, status, created_at
+       FROM orders WHERE id = $1`,
+      [Math.floor(id)]
+    );
+    if (!existing.rowCount) {
+      return json(res, 404, { error: "order not found", id: Math.floor(id) });
+    }
+    const order = existing.rows[0];
+    if (order.status === "cancelled") {
+      return json(res, 200, { order, already_cancelled: true });
+    }
 
-  const { rows } = await pool.query(
-    `UPDATE orders SET status = 'cancelled'
-     WHERE id = $1
-     RETURNING id, customer_email, amount_cents, status, created_at`,
-    [Math.floor(id)]
+    const { rows } = await pool.query(
+      `UPDATE orders SET status = 'cancelled'
+       WHERE id = $1
+       RETURNING id, customer_email, amount_cents, status, created_at`,
+      [Math.floor(id)]
+    );
+    maybeCrashAfterSuccess();
+    json(res, 200, { order: rows[0], already_cancelled: false });
+  });
+}
+
+/**
+ * One-click volume for the missing-index congestion demo.
+ * Uses generate_series; does NOT create an email index.
+ */
+async function handleSeedOrders(req, res) {
+  if (!pool) return json(res, 503, { error: "DATABASE_URL not configured" });
+  const body = await readJson(req);
+  if (body.confirm !== "seed") {
+    return json(res, 400, {
+      error: 'body must include confirm: "seed"',
+      example: { confirm: "seed", count: 80000, hotpath_extra: 200 },
+    });
+  }
+  const count = Math.min(
+    SEED_MAX,
+    Math.max(0, Math.floor(Number(body.count || 80_000)))
   );
-  maybeCrashAfterSuccess();
-  json(res, 200, { order: rows[0], already_cancelled: false });
+  const hotpathExtra = Math.min(
+    5_000,
+    Math.max(0, Math.floor(Number(body.hotpath_extra || 200)))
+  );
+  const hotpath = String(body.hotpath_email || "hotpath@example.com")
+    .trim()
+    .toLowerCase();
+
+  // Seed is intentionally outside withDemoLoad so scale knobs don't block prep.
+  const started = Date.now();
+  const before = await pool.query("SELECT COUNT(*)::bigint AS n FROM orders");
+  await pool.query(
+    `INSERT INTO orders (customer_email, amount_cents, status)
+     SELECT
+       'bulk-' || g::text || '@example.com',
+       500 + (g % 5000),
+       'created'
+     FROM generate_series(1, $1) AS g`,
+    [count]
+  );
+  if (hotpathExtra > 0) {
+    await pool.query(
+      `INSERT INTO orders (customer_email, amount_cents, status)
+       SELECT $1, 2500 + (g % 100), 'created'
+       FROM generate_series(1, $2) AS g`,
+      [hotpath, hotpathExtra]
+    );
+  }
+  const after = await pool.query("SELECT COUNT(*)::bigint AS n FROM orders");
+  json(res, 200, {
+    inserted_bulk: count,
+    inserted_hotpath: hotpathExtra,
+    hotpath_email: hotpath,
+    orders_before: Number(before.rows[0].n),
+    orders_after: Number(after.rows[0].n),
+    took_ms: Date.now() - started,
+    reminder: "No index on customer_email — use Hammer lookups next",
+  });
 }
 
 const server = http.createServer(async (req, res) => {
@@ -184,6 +302,9 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && path === "/orders/by-email") {
       return await handleLookupByEmail(req, res, url);
     }
+    if (req.method === "POST" && path === "/demo/seed-orders") {
+      return await handleSeedOrders(req, res);
+    }
     json(res, 404, { error: "not found" });
   } catch (err) {
     console.error(err);
@@ -193,6 +314,9 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, () => {
   console.log(`mars-demo-api listening on :${PORT}`);
+  console.log(
+    `demo knobs: DELAY_MS=${HANDLER_DELAY_MS} MAX_INFLIGHT=${MAX_INFLIGHT || "unlimited"} PG_POOL_MAX=${PG_POOL_MAX}`
+  );
   if (!DATABASE_URL) {
     console.warn("DATABASE_URL is not set; DB routes will return 503");
   }

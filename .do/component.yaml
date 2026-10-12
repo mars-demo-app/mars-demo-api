@@ -33,3 +33,14 @@ services:
       - key: DEMO_CRASH_AFTER_REQUESTS
         scope: RUN_TIME
         value: "0"
+      # Scale demo knobs — keep at 0 for normal browsing; raise in App Platform
+      # console for traffic→scale (see repo-setup-status playbook C).
+      - key: DEMO_HANDLER_DELAY_MS
+        scope: RUN_TIME
+        value: "0"
+      - key: DEMO_MAX_INFLIGHT
+        scope: RUN_TIME
+        value: "0"
+      - key: DEMO_PG_POOL_MAX
+        scope: RUN_TIME
+        value: "5"
