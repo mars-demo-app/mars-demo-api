@@ -29,29 +29,29 @@ const SLOW_LOG_MS = Math.max(0, Number(process.env.DEMO_SLOW_LOG_MS || 500) || 0
 const BURN_CPU_MAX_MS = Math.max(100, Number(process.env.DEMO_BURN_CPU_MAX_MS || 180_000) || 180_000);
 const BURN_CPU_DEFAULT_MS = 90_000;
 const BURN_CPU_DEFAULT_DUTY = Math.min(
-  0.9,
-  Math.max(0.1, Number(process.env.DEMO_BURN_CPU_DUTY || 0.35) || 0.35)
+  0.98,
+  Math.max(0.1, Number(process.env.DEMO_BURN_CPU_DUTY || process.env.DEMO_BURN_CPU_TARGET_PCT || 0.95) || 0.95)
 );
 const BURN_CPU_DEFAULT_SLICE_MS = Math.max(
   5,
-  Math.min(100, Number(process.env.DEMO_BURN_CPU_SLICE_MS || 12) || 12)
+  Math.min(100, Number(process.env.DEMO_BURN_CPU_SLICE_MS || 20) || 20)
 );
-/** Hard cap on one busy burst so HTTP can answer between spins. */
+/** Hard cap on one busy burst — high enough for ~95% duty with short yields. */
 const BURN_CPU_MAX_BUSY_MS = Math.max(
   1,
-  Math.min(20, Number(process.env.DEMO_BURN_CPU_MAX_BUSY_MS || 6) || 6)
+  Math.min(50, Number(process.env.DEMO_BURN_CPU_MAX_BUSY_MS || 19) || 19)
 );
 
 /**
  * Burn-memory: grow RSS toward target_pct of the instance memory limit, then hold.
- * apps-s-1vcpu-0.5gb ≈ 512MiB cgroup — never allocate past the target (default 90%)
- * so HTTP keeps headroom. Two concurrent fixed retains previously OOM'd (exit 128).
+ * apps-s-1vcpu-0.5gb ≈ 512MiB cgroup — default 95% crosses common 90% alert
+ * thresholds while leaving ~5% headroom for HTTP. Single-burn only (exit 128 OOM).
  */
 const BURN_MEM_MAX_HOLD_MS = Math.max(100, Number(process.env.DEMO_BURN_MEM_MAX_HOLD_MS || 180_000) || 180_000);
 const BURN_MEM_DEFAULT_HOLD_MS = 60_000;
 const BURN_MEM_DEFAULT_TARGET_PCT = Math.min(
-  0.95,
-  Math.max(0.5, Number(process.env.DEMO_BURN_MEM_TARGET_PCT || 0.9) || 0.9)
+  0.98,
+  Math.max(0.5, Number(process.env.DEMO_BURN_MEM_TARGET_PCT || 0.95) || 0.95)
 );
 /** Chunk size while approaching the target (keeps alloc incremental + yields). */
 const BURN_MEM_CHUNK_MB = Math.max(
@@ -246,6 +246,7 @@ async function handleHealth(_req, res) {
           cpu_max_ms: BURN_CPU_MAX_MS,
           cpu_default_ms: BURN_CPU_DEFAULT_MS,
           cpu_default_duty: BURN_CPU_DEFAULT_DUTY,
+          cpu_target_pct: BURN_CPU_DEFAULT_DUTY,
           cpu_default_slice_ms: BURN_CPU_DEFAULT_SLICE_MS,
           cpu_max_busy_ms: BURN_CPU_MAX_BUSY_MS,
           mem_default_hold_ms: BURN_MEM_DEFAULT_HOLD_MS,
@@ -488,9 +489,9 @@ function detectMemLimitMb() {
 }
 
 /**
- * Short busy bursts on the event loop, then yield via setTimeout.
- * Defaults (~4ms busy / ~8ms yield @ duty 0.35 / slice 12) keep health+API
- * answering while average CPU stays elevated for a ~60–90s Insights window.
+ * Short busy bursts on the event loop, then yield via setTimeout/setImmediate.
+ * Defaults (~19ms busy / ~1ms yield @ duty 0.95 / slice 20) sustain high CPU
+ * for Insights while still letting health/API run between spins.
  */
 function yieldFor(ms) {
   return new Promise((resolve) => {
@@ -529,7 +530,7 @@ async function dutyCycleCpuBurn(durationMs, dutyCycle, sliceMs) {
 /**
  * POST/GET /api/demo/burn-cpu
  * Background duty-cycled burn; returns 202 immediately.
- * Params: duration_ms (default 90000), duty_cycle (default 0.35), slice_ms (default 12).
+ * Params: duration_ms (default 90000), duty_cycle|target_pct (default 0.95), slice_ms (default 20).
  * Legacy `workers` ignored — worker pegs cause 504s on 1 vCPU.
  */
 async function handleBurnCpu(req, res, url) {
@@ -541,10 +542,13 @@ async function handleBurnCpu(req, res, url) {
     BURN_CPU_MAX_MS
   );
   const dutyCycle = clampFloat(
-    body.duty_cycle ?? url.searchParams.get("duty_cycle"),
+    body.duty_cycle ??
+      body.target_pct ??
+      url.searchParams.get("duty_cycle") ??
+      url.searchParams.get("target_pct"),
     BURN_CPU_DEFAULT_DUTY,
     0.1,
-    0.9
+    0.98
   );
   const sliceMs = clampInt(
     body.slice_ms ?? url.searchParams.get("slice_ms"),
@@ -680,7 +684,7 @@ async function growRssTowardTarget(targetRssMb, chunkMb) {
 
 /**
  * POST/GET /api/demo/burn-memory
- * Grow RSS toward target_pct (default 0.9) of the instance memory limit, hold hold_ms.
+ * Grow RSS toward target_pct (default 0.95) of the instance memory limit, hold hold_ms.
  * Params: target_pct, hold_ms. Optional legacy `mb` ignored for sizing (logged if present).
  * Single active mem burn only (429 on second click).
  */
@@ -696,7 +700,7 @@ async function handleBurnMemory(req, res, url) {
     body.target_pct ?? url.searchParams.get("target_pct"),
     BURN_MEM_DEFAULT_TARGET_PCT,
     0.5,
-    0.95
+    0.98
   );
   const allowStack =
     body.allow_stack === true ||

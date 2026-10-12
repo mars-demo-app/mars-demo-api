@@ -49,10 +49,10 @@ Defaults are safe for normal browsing (no artificial delay, unlimited inflight).
 | `DEMO_PG_POOL_MAX` | `5` | pg pool size (small → connection wait under hammer) |
 | `DEMO_SLOW_LOG_MS` | `500` | Warn-log successful handlers slower than this (`MARS_DEMO_SLOW`) |
 | `DEMO_BURN_CPU_MAX_MS` | `180000` | Hard cap for `/demo/burn-cpu` duration |
-| `DEMO_BURN_CPU_DUTY` | `0.35` | Default duty cycle (busy fraction per slice) |
-| `DEMO_BURN_CPU_SLICE_MS` | `12` | Busy+yield slice length |
-| `DEMO_BURN_CPU_MAX_BUSY_MS` | `6` | Hard cap on one busy burst |
-| `DEMO_BURN_MEM_TARGET_PCT` | `0.9` | Target RSS as fraction of instance limit |
+| `DEMO_BURN_CPU_DUTY` / `DEMO_BURN_CPU_TARGET_PCT` | `0.95` | Default busy fraction per slice (alias) |
+| `DEMO_BURN_CPU_SLICE_MS` | `20` | Busy+yield slice length (~19ms busy / ~1ms yield @ 0.95) |
+| `DEMO_BURN_CPU_MAX_BUSY_MS` | `19` | Hard cap on one busy burst |
+| `DEMO_BURN_MEM_TARGET_PCT` | `0.95` | Target RSS as fraction of instance limit (crosses 90% alerts) |
 | `DEMO_MEM_LIMIT_MB` | _(auto)_ | Override instance memory limit (MiB); alias `DEMO_BURN_MEM_LIMIT_MB` |
 | `DEMO_BURN_MEM_MAX_HOLD_MS` | `180000` | Hard cap for memory hold duration |
 | `DEMO_BURN_MEM_CHUNK_MB` | `16` | Chunk size while climbing to target |
@@ -61,9 +61,9 @@ Defaults are safe for normal browsing (no artificial delay, unlimited inflight).
 
 Returns **202 Accepted** and burns in the background.
 
-**CPU** — short event-loop busy/yield (`duty_cycle=0.35`, `slice_ms=12`). At most **one** CPU burn; stacking on an active mem burn → **429** unless `allow_stack:true`.
+**CPU** — short event-loop busy/yield (`duty_cycle`/`target_pct`=0.95, `slice_ms=20`). At most **one** CPU burn; stacking on an active mem burn → **429** unless `allow_stack:true`.
 
-**Memory** — grow RSS toward **`target_pct` (default 0.9)** of the instance memory **limit**, then hold `hold_ms`. Never allocates past that target (leaves ~10% headroom for HTTP). At most **one** mem burn (**429** on double-click). If RSS is already ≥ target → **409** no-op.
+**Memory** — grow RSS toward **`target_pct` (default 0.95)** of the instance memory **limit**, then hold `hold_ms`. Never allocates past that target (leaves ~5% headroom for HTTP). At most **one** mem burn (**429** on double-click). If RSS is already ≥ target → **409** no-op.
 
 **How the limit is chosen** (first match):
 
@@ -76,14 +76,14 @@ Returns **202 Accepted** and burns in the background.
 
 | Endpoint | Defaults | Guards |
 | --- | --- | --- |
-| `/api/demo/burn-cpu` | `duration_ms=90000`, `duty_cycle=0.35`, `slice_ms=12` | one at a time |
-| `/api/demo/burn-memory` | `target_pct=0.9`, `hold_ms=60000` | one at a time; stop at 90% of limit |
+| `/api/demo/burn-cpu` | `duration_ms=90000`, `duty_cycle=0.95`, `slice_ms=20` | one at a time; yields between slices |
+| `/api/demo/burn-memory` | `target_pct=0.95`, `hold_ms=60000` | one at a time; stop at 95% of limit |
 
 ```bash
-# UI defaults — grow to ~90% of instance limit, hold 60s
+# UI defaults — grow to ~95% of instance limit, hold 60s
 curl -sS -X POST https://mars-demo-4qji6.ondigitalocean.app/api/demo/burn-memory \
   -H 'Content-Type: application/json' \
-  -d '{"target_pct":0.9,"hold_ms":60000}'
+  -d '{"target_pct":0.95,"hold_ms":60000}'
 
 # Override detected limit (e.g. if cgroup unreadable locally)
 DEMO_MEM_LIMIT_MB=512 npm start
