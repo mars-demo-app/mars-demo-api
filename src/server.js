@@ -400,12 +400,15 @@ async function handleSeedOrders(req, res) {
 }
 
 function clampInt(raw, fallback, min, max) {
+  // null/undefined/"" must use fallback — Number(null) is 0 and would clamp to min.
+  if (raw === null || raw === undefined || raw === "") return fallback;
   const n = Number(raw);
   if (!Number.isFinite(n)) return fallback;
   return Math.min(max, Math.max(min, Math.floor(n)));
 }
 
 function clampFloat(raw, fallback, min, max) {
+  if (raw === null || raw === undefined || raw === "") return fallback;
   const n = Number(raw);
   if (!Number.isFinite(n)) return fallback;
   return Math.min(max, Math.max(min, n));
