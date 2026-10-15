@@ -17,14 +17,16 @@ Backend HTTP service for the **Mars Demo Shop** on DigitalOcean App Platform.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/api/health` (or `/health`) | Liveness + DB ping + demo knobs |
+| `GET` | `/api/health` (or `/health`) | Liveness + DB ping + demo knobs / log markers |
 | `GET` | `/api/orders` | Recent orders |
 | `POST` | `/api/orders` | Create order `{ customer_email, amount_cents }` |
 | `POST` | `/api/orders/cancel` | Soft-cancel order `{ id }` → `status: cancelled` |
 | `GET` | `/api/orders/by-email?email=` | Unindexed lookup (latent-bug / congestion path) |
 | `POST` | `/api/demo/seed-orders` | Bulk insert for congestion demo (`confirm: "seed"`) |
-| `GET`/`POST` | `/api/demo/burn-cpu` | Duty-cycled CPU burn (`duration_ms`, `duty_cycle`, `slice_ms`) |
-| `GET`/`POST` | `/api/demo/burn-memory` | Grow RSS to `target_pct` of mem limit, hold `hold_ms` (single-burn) |
+| `GET`/`POST` | `/api/demo/burn-cpu` | Duty-cycled CPU burn — **202** background (`duration_ms`, `duty_cycle`) |
+| `GET`/`POST` | `/api/demo/burn-memory` | Grow RSS to `target_pct` of mem limit — **202** background |
+| `GET`/`POST` | `/api/demo/slow` | Delayed 200 → exact `MARS_DEMO_SLOW`; drive p95 |
+| `POST` | `/api/demo/crash-now` | Exact `MARS_DEMO_BAD_DEPLOY` + `exit(1)` (`{"confirm":"crash"}`) |
 
 ## Local run
 
@@ -76,25 +78,50 @@ Returns **202 Accepted** and burns in the background.
 
 | Endpoint | Defaults | Guards |
 | --- | --- | --- |
-| `/api/demo/burn-cpu` | `duration_ms=90000`, `duty_cycle=0.95`, `slice_ms=20` | one at a time; yields between slices |
-| `/api/demo/burn-memory` | `target_pct=0.95`, `hold_ms=60000` | one at a time; stop at 95% of limit |
+| `/api/demo/burn-cpu` | `duration_ms=120000`, `duty_cycle=0.95`, `slice_ms=20` | one at a time; yields between slices; **202** |
+| `/api/demo/burn-memory` | `target_pct=0.95`, `hold_ms=120000` | one at a time; stop at 95% of limit; **202** |
+| `/api/demo/slow` | `ms≈800` (cap 15s) | sync delayed 200; emits **`MARS_DEMO_SLOW`** |
+| `/api/demo/crash-now` | `{"confirm":"crash"}` | **`MARS_DEMO_BAD_DEPLOY`** JSON + exit(1); **202** then die |
 
 ```bash
-# UI defaults — grow to ~95% of instance limit, hold 60s
-curl -sS -X POST https://mars-demo-4qji6.ondigitalocean.app/api/demo/burn-memory \
+BASE=https://mars-demo-4qji6.ondigitalocean.app
+
+# CPU — returns immediately; watch Insights app_cpu_utilization for a sustained bump
+curl -sS -X POST "$BASE/api/demo/burn-cpu" \
   -H 'Content-Type: application/json' \
-  -d '{"target_pct":0.95,"hold_ms":60000}'
+  -d '{"duration_ms":120000,"duty_cycle":0.95}'
+
+# Memory — grow to ~95% of instance limit, hold 120s (covers ≥1 Insights scrape)
+curl -sS -X POST "$BASE/api/demo/burn-memory" \
+  -H 'Content-Type: application/json' \
+  -d '{"target_pct":0.95,"hold_ms":120000}'
+
+# Latent slow / p95 — many short delayed requests (avoid 504: keep ms << gateway timeout)
+for i in $(seq 1 40); do
+  curl -sS -o /dev/null -X POST "$BASE/api/demo/slow" \
+    -H 'Content-Type: application/json' -d '{"ms":1000}' &
+done
+wait
+
+# Bad deploy / restart — exact marker string + process exit (no env redeploy)
+curl -sS -X POST "$BASE/api/demo/crash-now" \
+  -H 'Content-Type: application/json' -d '{"confirm":"crash"}'
 
 # Override detected limit (e.g. if cgroup unreadable locally)
 DEMO_MEM_LIMIT_MB=512 npm start
 ```
+
+**Instance size tip:** Prefer **`apps-s-1vcpu-1gb`** (or larger) for memory burns. On `0.5gb`, RSS→95% is one step from OOM/exit 128 and gateway **504**s while the container restarts. CPU burns stay duty-cycled so health keeps answering on 1 vCPU.
+
+**Insights vs process:** Organic `do.apps.app_*_utilization` often peaks well below 90% even when burns succeed (CPU burn peak ~50% observed; memory Catalog can lag process RSS). Detectors should key on a **clear sustained spike vs idle**, not absolute 90. Pair with `app_request_duration_p95` (via `/demo/slow`) and `app_restarts_total` (via `/demo/crash-now`).
 
 ### Log markers (App Platform `api` runtime logs)
 
 | Marker | When |
 | --- | --- |
 | **`MARS_DEMO_5XX`** | Any HTTP 5xx the Node process returns (503 saturated, 500 handler errors, etc.) |
-| **`MARS_DEMO_SLOW`** | Successful handler slower than `DEMO_SLOW_LOG_MS` (by-email hammer / seed) |
+| **`MARS_DEMO_SLOW`** | Successful handler slower than `DEMO_SLOW_LOG_MS` (`/demo/slow`, seed, delayed handlers) |
+| **`MARS_DEMO_BAD_DEPLOY`** | `/demo/crash-now` or `DEMO_CRASH_AFTER_REQUESTS` — JSON `{"marker":"MARS_DEMO_BAD_DEPLOY","level":"error",…}` plus plain line |
 | **`MARS_DEMO_BURN_CPU`** | CPU burn start/end (and error) |
 | **`MARS_DEMO_BURN_MEM`** | Memory burn start/end — includes `target_pct`, `limit_mb`, `rss_mb_before` / after |
 | **`MARS_DEMO_OOM`** | Process received SIGTERM/SIGINT (graceful). **Cannot** catch cgroup OOM/SIGKILL (exit 128) |

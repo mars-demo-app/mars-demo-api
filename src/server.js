@@ -27,7 +27,8 @@ const SLOW_LOG_MS = Math.max(0, Number(process.env.DEMO_SLOW_LOG_MS || 500) || 0
  * short (≤~10ms) lets health/API run between spins for a sustained graph.
  */
 const BURN_CPU_MAX_MS = Math.max(100, Number(process.env.DEMO_BURN_CPU_MAX_MS || 180_000) || 180_000);
-const BURN_CPU_DEFAULT_MS = 90_000;
+/** Default long enough for ≥1 Insights scrape (~60s) while staying under gateway patience. */
+const BURN_CPU_DEFAULT_MS = 120_000;
 const BURN_CPU_DEFAULT_DUTY = Math.min(
   0.98,
   Math.max(0.1, Number(process.env.DEMO_BURN_CPU_DUTY || process.env.DEMO_BURN_CPU_TARGET_PCT || 0.95) || 0.95)
@@ -48,7 +49,8 @@ const BURN_CPU_MAX_BUSY_MS = Math.max(
  * thresholds while leaving ~5% headroom for HTTP. Single-burn only (exit 128 OOM).
  */
 const BURN_MEM_MAX_HOLD_MS = Math.max(100, Number(process.env.DEMO_BURN_MEM_MAX_HOLD_MS || 180_000) || 180_000);
-const BURN_MEM_DEFAULT_HOLD_MS = 60_000;
+/** Hold past at least one Insights memory scrape window. */
+const BURN_MEM_DEFAULT_HOLD_MS = 120_000;
 const BURN_MEM_DEFAULT_TARGET_PCT = Math.min(
   0.98,
   Math.max(0.5, Number(process.env.DEMO_BURN_MEM_TARGET_PCT || 0.95) || 0.95)
@@ -67,6 +69,7 @@ const BURN_MEM_LIMIT_FALLBACK_MB = Math.max(
 const MARKER_5XX = "MARS_DEMO_5XX";
 const MARKER_SLOW = "MARS_DEMO_SLOW";
 const MARKER_CANCEL_BREAK = "MARS_DEMO_ERROR_LOG";
+const MARKER_BAD_DEPLOY = "MARS_DEMO_BAD_DEPLOY";
 const MARKER_BURN_CPU = "MARS_DEMO_BURN_CPU";
 const MARKER_BURN_MEM = "MARS_DEMO_BURN_MEM";
 const MARKER_OOM = "MARS_DEMO_OOM";
@@ -164,8 +167,20 @@ function maybeCrashAfterSuccess() {
   if (!CRASH_AFTER || CRASH_AFTER <= 0) return;
   requestCount += 1;
   if (requestCount >= CRASH_AFTER) {
+    // Structured marker first so fat/enrich can match without relying on
+    // OTLP severity (App Platform often ships severity_number=0).
     console.error(
-      `[demo] DEMO_CRASH_AFTER_REQUESTS=${CRASH_AFTER} reached; exiting to simulate bad deploy`
+      JSON.stringify({
+        marker: MARKER_BAD_DEPLOY,
+        level: "error",
+        kind: "bad_deploy",
+        crash_after_requests: CRASH_AFTER,
+        requests_seen: requestCount,
+        note: "exiting to simulate bad deploy",
+      })
+    );
+    console.error(
+      `[demo] ${MARKER_BAD_DEPLOY} DEMO_CRASH_AFTER_REQUESTS=${CRASH_AFTER} reached; exiting to simulate bad deploy`
     );
     setTimeout(() => process.exit(1), 50);
   }
@@ -260,6 +275,7 @@ async function handleHealth(_req, res) {
       log_markers: {
         five_xx: MARKER_5XX,
         slow: MARKER_SLOW,
+        bad_deploy: MARKER_BAD_DEPLOY,
         burn_cpu: MARKER_BURN_CPU,
         burn_mem: MARKER_BURN_MEM,
         oom: MARKER_OOM,
@@ -834,6 +850,70 @@ async function handleBurnMemory(req, res, url) {
   });
 }
 
+/**
+ * GET/POST /api/demo/slow — synchronous delayed 200 for p95 + MARS_DEMO_SLOW.
+ * Params: ms (default max(DEMO_SLOW_LOG_MS, 800), cap 15000).
+ * Hammer this from outside to move do.apps.app_request_duration_p95 without 504s
+ * (keep ms well under gateway timeout; prefer many parallel ~1s calls).
+ */
+async function handleDemoSlow(req, res, url) {
+  const body = req.method === "POST" ? await readJson(req) : {};
+  const defaultMs = Math.max(SLOW_LOG_MS || 500, 800);
+  const delayMs = clampInt(
+    body.ms ?? url.searchParams.get("ms"),
+    defaultMs,
+    50,
+    15_000
+  );
+  const started = performance.now();
+  await sleep(delayMs);
+  const tookMs = Math.round(performance.now() - started);
+  maybeLogSlow(res, tookMs, { kind: "demo-slow", delay_ms: delayMs });
+  maybeCrashAfterSuccess();
+  return json(res, 200, {
+    ok: true,
+    slow: true,
+    delay_ms: delayMs,
+    took_ms: tookMs,
+    marker: tookMs >= SLOW_LOG_MS ? MARKER_SLOW : null,
+    note: "Call repeatedly/in parallel to raise Insights request_duration_p95",
+  });
+}
+
+/**
+ * POST /api/demo/crash-now — emit MARS_DEMO_BAD_DEPLOY and exit(1).
+ * Body: { "confirm": "crash" }. No redeploy / DEMO_CRASH_AFTER_REQUESTS needed.
+ * App Platform restart increments do.apps.app_restarts_total for fat detectors.
+ */
+async function handleCrashNow(req, res) {
+  const body = await readJson(req);
+  if (String(body.confirm || "") !== "crash") {
+    return json(res, 400, {
+      error: 'pass {"confirm":"crash"} to emit MARS_DEMO_BAD_DEPLOY and exit',
+    });
+  }
+  console.error(
+    JSON.stringify({
+      marker: MARKER_BAD_DEPLOY,
+      level: "error",
+      kind: "bad_deploy",
+      event: "crash_now",
+      note: "exiting to simulate bad deploy",
+    })
+  );
+  console.error(
+    `[demo] ${MARKER_BAD_DEPLOY} crash-now; exiting to simulate bad deploy`
+  );
+  // Answer first so the client sees 202; process dies moments later.
+  json(res, 202, {
+    ok: true,
+    accepted: true,
+    marker: MARKER_BAD_DEPLOY,
+    note: "process will exit(1) shortly — expect gateway 504 until restart",
+  });
+  setTimeout(() => process.exit(1), 80);
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
   // App Platform ingress strips nothing by default when matching /api prefix;
@@ -872,6 +952,15 @@ const server = http.createServer(async (req, res) => {
       path === "/demo/burn-memory"
     ) {
       return await handleBurnMemory(req, res, url);
+    }
+    if (
+      (req.method === "POST" || req.method === "GET") &&
+      path === "/demo/slow"
+    ) {
+      return await handleDemoSlow(req, res, url);
+    }
+    if (req.method === "POST" && path === "/demo/crash-now") {
+      return await handleCrashNow(req, res);
     }
     json(res, 404, { error: "not found" });
   } catch (err) {
