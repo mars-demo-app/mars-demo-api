@@ -17,14 +17,14 @@ Backend HTTP service for the **Mars Demo Shop** on DigitalOcean App Platform.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/api/health` (or `/health`) | Liveness + DB ping + demo knobs |
+| `GET` | `/api/health` (or `/health`) | Liveness + DB ping + demo knobs / log markers |
 | `GET` | `/api/orders` | Recent orders |
 | `POST` | `/api/orders` | Create order `{ customer_email, amount_cents }` |
 | `POST` | `/api/orders/cancel` | Soft-cancel order `{ id }` → `status: cancelled` |
-| `GET` | `/api/orders/by-email?email=` | Unindexed lookup (latent-bug / congestion path) |
-| `POST` | `/api/demo/seed-orders` | Bulk insert for congestion demo (`confirm: "seed"`) |
-| `GET`/`POST` | `/api/demo/burn-cpu` | Duty-cycled CPU burn (`duration_ms`, `duty_cycle`, `slice_ms`) |
-| `GET`/`POST` | `/api/demo/burn-memory` | Grow RSS to `target_pct` of mem limit, hold `hold_ms` (single-burn) |
+| `GET` | `/api/orders/by-email?email=` | Lookup orders by email (normal app traffic) |
+| `GET`/`POST` | `/api/demo/burn-cpu` | Duty-cycled CPU burn — **202**; re-POST **extends** duration |
+| `GET`/`POST` | `/api/demo/burn-memory` | Grow RSS to `target_pct` of mem limit — **202**; re-POST **extends** hold |
+| `POST` | `/api/demo/crash-now` | Intentional `exit(1)` for App Platform restart metrics (`{"confirm":"crash"}`) |
 
 ## Local run
 
@@ -43,27 +43,26 @@ Defaults are safe for normal browsing (no artificial delay, unlimited inflight).
 
 | Env | Default | Purpose |
 | --- | --- | --- |
-| `DEMO_CRASH_AFTER_REQUESTS` | `0` | Exit after N successful demo requests (bad deploy) |
+| `DEMO_CRASH_AFTER_REQUESTS` | `0` | Exit after N successful demo requests (raises restart metrics) |
 | `DEMO_HANDLER_DELAY_MS` | `0` | Artificial delay on non-health handlers (scale demo) |
 | `DEMO_MAX_INFLIGHT` | `0` | Cap concurrent non-health handlers; `0` = unlimited. Over cap → HTTP 503 |
-| `DEMO_PG_POOL_MAX` | `5` | pg pool size (small → connection wait under hammer) |
-| `DEMO_SLOW_LOG_MS` | `500` | Warn-log successful handlers slower than this (`MARS_DEMO_SLOW`) |
-| `DEMO_BURN_CPU_MAX_MS` | `180000` | Hard cap for `/demo/burn-cpu` duration |
+| `DEMO_PG_POOL_MAX` | `5` | pg pool size |
+| `DEMO_BURN_CPU_MAX_MS` | `180000` | Hard cap for one CPU burn window from “now” when extending |
 | `DEMO_BURN_CPU_DUTY` / `DEMO_BURN_CPU_TARGET_PCT` | `0.95` | Default busy fraction per slice (alias) |
 | `DEMO_BURN_CPU_SLICE_MS` | `20` | Busy+yield slice length (~19ms busy / ~1ms yield @ 0.95) |
 | `DEMO_BURN_CPU_MAX_BUSY_MS` | `19` | Hard cap on one busy burst |
-| `DEMO_BURN_MEM_TARGET_PCT` | `0.95` | Target RSS as fraction of instance limit (crosses 90% alerts) |
+| `DEMO_BURN_MEM_TARGET_PCT` | `0.95` | Target RSS as fraction of instance limit |
 | `DEMO_MEM_LIMIT_MB` | _(auto)_ | Override instance memory limit (MiB); alias `DEMO_BURN_MEM_LIMIT_MB` |
-| `DEMO_BURN_MEM_MAX_HOLD_MS` | `180000` | Hard cap for memory hold duration |
+| `DEMO_BURN_MEM_MAX_HOLD_MS` | `180000` | Hard cap for memory hold window from “now” when extending |
 | `DEMO_BURN_MEM_CHUNK_MB` | `16` | Chunk size while climbing to target |
 
 ### Burn demos (CPU / memory)
 
 Returns **202 Accepted** and burns in the background.
 
-**CPU** — short event-loop busy/yield (`duty_cycle`/`target_pct`=0.95, `slice_ms=20`). At most **one** CPU burn; stacking on an active mem burn → **429** unless `allow_stack:true`.
+**CPU** — short event-loop busy/yield (`duty_cycle`/`target_pct`=0.95, `slice_ms`=20). One active burner; a second `POST` **extends** `ends_at` by `duration_ms` (capped) and returns `extended: true`, `new_ends_at`. Stacking on an active mem burn → **429** unless `allow_stack:true`.
 
-**Memory** — grow RSS toward **`target_pct` (default 0.95)** of the instance memory **limit**, then hold `hold_ms`. Never allocates past that target (leaves ~5% headroom for HTTP). At most **one** mem burn (**429** on double-click). If RSS is already ≥ target → **409** no-op.
+**Memory** — grow RSS toward **`target_pct` (default 0.95)** of the instance memory **limit**, then hold. Never allocates past that target. A second `POST` **extends** the hold (`extended: true`, `new_ends_at`) without a second retain. If RSS is already ≥ target with no active burn → **409** no-op.
 
 **How the limit is chosen** (first match):
 
@@ -72,31 +71,50 @@ Returns **202 Accepted** and burns in the background.
 3. `NODE_OPTIONS=--max-old-space-size=N` (heap hint only)
 4. Fallback **512** (`apps-s-1vcpu-0.5gb`)
 
-⚠️ **Exit 128 after `MARS_DEMO_BURN_MEM`** = App Platform **OOM-killed** the container. While restarting, the **gateway returns 504** — not an app 504 body. Fixed-size double retains (2×380MB) caused this; the 90% grow mode + single-burn guard prevent it.
+⚠️ **Exit 128 after `MARS_DEMO_BURN_MEM`** = App Platform **OOM-killed** the container. While restarting, the **gateway returns 504** — not an app 504 body.
 
-| Endpoint | Defaults | Guards |
+| Endpoint | Defaults | Behavior |
 | --- | --- | --- |
-| `/api/demo/burn-cpu` | `duration_ms=90000`, `duty_cycle=0.95`, `slice_ms=20` | one at a time; yields between slices |
-| `/api/demo/burn-memory` | `target_pct=0.95`, `hold_ms=60000` | one at a time; stop at 95% of limit |
+| `/api/demo/burn-cpu` | `duration_ms=120000`, `duty_cycle=0.95` | **202**; re-POST extends |
+| `/api/demo/burn-memory` | `target_pct=0.95`, `hold_ms=120000` | **202**; re-POST extends hold |
+| `/api/demo/crash-now` | `{"confirm":"crash"}` | `exit(1)` after **202** — restart metrics |
 
 ```bash
-# UI defaults — grow to ~95% of instance limit, hold 60s
-curl -sS -X POST https://mars-demo-4qji6.ondigitalocean.app/api/demo/burn-memory \
-  -H 'Content-Type: application/json' \
-  -d '{"target_pct":0.95,"hold_ms":60000}'
+BASE=https://mars-demo-4qji6.ondigitalocean.app
 
-# Override detected limit (e.g. if cgroup unreadable locally)
-DEMO_MEM_LIMIT_MB=512 npm start
+# CPU — returns immediately; re-POST extends the same burn
+curl -sS -X POST "$BASE/api/demo/burn-cpu" \
+  -H 'Content-Type: application/json' \
+  -d '{"duration_ms":120000,"duty_cycle":0.95}'
+curl -sS -X POST "$BASE/api/demo/burn-cpu" \
+  -H 'Content-Type: application/json' \
+  -d '{"duration_ms":60000}'   # → extended:true, new_ends_at:…
+
+# Memory — grow to ~95% of instance limit; re-POST extends hold
+curl -sS -X POST "$BASE/api/demo/burn-memory" \
+  -H 'Content-Type: application/json' \
+  -d '{"target_pct":0.95,"hold_ms":120000}'
+
+# Restart metrics — process exit (no env redeploy)
+curl -sS -X POST "$BASE/api/demo/crash-now" \
+  -H 'Content-Type: application/json' -d '{"confirm":"crash"}'
 ```
+
+**Instance size tip:** Prefer **`apps-s-1vcpu-1gb`** (or larger) for memory burns. On `0.5gb`, RSS→95% is one step from OOM/exit 128 and gateway **504**s while the container restarts.
+
+**What MARS should infer (not from planted log strings):**
+
+- CPU / memory pressure → App Platform utilization gauges (clear sustained spike vs idle; organic peaks are often ≪ 90%)
+- Restart / crash-loop → `do.apps.app_restarts_total` / crash-loop gauges + platform deploy/build signals (`/demo/crash-now`)
+- Latency / index issues → **managed DB Insights**, not app log markers or synthetic slow-order fixtures
 
 ### Log markers (App Platform `api` runtime logs)
 
 | Marker | When |
 | --- | --- |
 | **`MARS_DEMO_5XX`** | Any HTTP 5xx the Node process returns (503 saturated, 500 handler errors, etc.) |
-| **`MARS_DEMO_SLOW`** | Successful handler slower than `DEMO_SLOW_LOG_MS` (by-email hammer / seed) |
-| **`MARS_DEMO_BURN_CPU`** | CPU burn start/end (and error) |
-| **`MARS_DEMO_BURN_MEM`** | Memory burn start/end — includes `target_pct`, `limit_mb`, `rss_mb_before` / after |
+| **`MARS_DEMO_BURN_CPU`** | CPU burn start / extend / end (and error) |
+| **`MARS_DEMO_BURN_MEM`** | Memory burn start / extend / end |
 | **`MARS_DEMO_OOM`** | Process received SIGTERM/SIGINT (graceful). **Cannot** catch cgroup OOM/SIGKILL (exit 128) |
 | **`MARS_DEMO_ERROR_LOG`** | Cancel-break demo PR only (skips a duplicate `MARS_DEMO_5XX` line) |
 

@@ -13,12 +13,8 @@ const CRASH_AFTER = Number(process.env.DEMO_CRASH_AFTER_REQUESTS || 0);
 const HANDLER_DELAY_MS = Math.max(0, Number(process.env.DEMO_HANDLER_DELAY_MS || 0) || 0);
 /** Cap concurrent in-flight non-health handlers. 0 = unlimited (safe default). */
 const MAX_INFLIGHT = Math.max(0, Number(process.env.DEMO_MAX_INFLIGHT || 0) || 0);
-/** pg pool size; keep small so unindexed hammers show connection wait. */
+/** pg pool size; keep modest under concurrent load. */
 const PG_POOL_MAX = Math.max(1, Number(process.env.DEMO_PG_POOL_MAX || 5) || 5);
-/** Hard cap for one-click seed endpoint. */
-const SEED_MAX = 200_000;
-/** Warn-log successful handlers slower than this (ms). Helps when edge 504s never reach Node. */
-const SLOW_LOG_MS = Math.max(0, Number(process.env.DEMO_SLOW_LOG_MS || 500) || 0);
 
 /**
  * Burn-CPU: short duty-cycled busy/yield on the event loop.
@@ -27,7 +23,8 @@ const SLOW_LOG_MS = Math.max(0, Number(process.env.DEMO_SLOW_LOG_MS || 500) || 0
  * short (≤~10ms) lets health/API run between spins for a sustained graph.
  */
 const BURN_CPU_MAX_MS = Math.max(100, Number(process.env.DEMO_BURN_CPU_MAX_MS || 180_000) || 180_000);
-const BURN_CPU_DEFAULT_MS = 90_000;
+/** Default long enough for ≥1 Insights scrape (~60s) while staying under gateway patience. */
+const BURN_CPU_DEFAULT_MS = 120_000;
 const BURN_CPU_DEFAULT_DUTY = Math.min(
   0.98,
   Math.max(0.1, Number(process.env.DEMO_BURN_CPU_DUTY || process.env.DEMO_BURN_CPU_TARGET_PCT || 0.95) || 0.95)
@@ -48,7 +45,8 @@ const BURN_CPU_MAX_BUSY_MS = Math.max(
  * thresholds while leaving ~5% headroom for HTTP. Single-burn only (exit 128 OOM).
  */
 const BURN_MEM_MAX_HOLD_MS = Math.max(100, Number(process.env.DEMO_BURN_MEM_MAX_HOLD_MS || 180_000) || 180_000);
-const BURN_MEM_DEFAULT_HOLD_MS = 60_000;
+/** Hold past at least one Insights memory scrape window. */
+const BURN_MEM_DEFAULT_HOLD_MS = 120_000;
 const BURN_MEM_DEFAULT_TARGET_PCT = Math.min(
   0.98,
   Math.max(0.5, Number(process.env.DEMO_BURN_MEM_TARGET_PCT || 0.95) || 0.95)
@@ -65,7 +63,6 @@ const BURN_MEM_LIMIT_FALLBACK_MB = Math.max(
 );
 
 const MARKER_5XX = "MARS_DEMO_5XX";
-const MARKER_SLOW = "MARS_DEMO_SLOW";
 const MARKER_CANCEL_BREAK = "MARS_DEMO_ERROR_LOG";
 const MARKER_BURN_CPU = "MARS_DEMO_BURN_CPU";
 const MARKER_BURN_MEM = "MARS_DEMO_BURN_MEM";
@@ -75,10 +72,16 @@ let requestCount = 0;
 let inflight = 0;
 let peakInflight = 0;
 let saturatedTotal = 0;
-let cpuBurnsActive = 0;
-let memBurnsActive = 0;
+/** Active CPU burn, or null. Re-POSTs extend endsAt instead of 429. */
+let cpuBurn = null;
+/** Active memory burn, or null. Re-POSTs extend endsAt instead of 429. */
+let memBurn = null;
 /** Retained during memory burns so V8 cannot GC the allocation early. */
 const retainedMemChunks = [];
+
+function isoEndsAt(ms) {
+  return new Date(ms).toISOString();
+}
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -143,29 +146,19 @@ function json(res, status, body, opts = {}) {
   res.end(payload);
 }
 
-function maybeLogSlow(res, tookMs, extra = {}) {
-  if (!SLOW_LOG_MS || tookMs < SLOW_LOG_MS) return;
-  const ctx = res.__mars || {};
-  console.warn(
-    JSON.stringify({
-      marker: MARKER_SLOW,
-      level: "warn",
-      status: 200,
-      method: ctx.method || null,
-      path: ctx.path || null,
-      took_ms: tookMs,
-      threshold_ms: SLOW_LOG_MS,
-      ...extra,
-    })
-  );
-}
-
 function maybeCrashAfterSuccess() {
   if (!CRASH_AFTER || CRASH_AFTER <= 0) return;
   requestCount += 1;
   if (requestCount >= CRASH_AFTER) {
+    // Intentional exit so App Platform increments restart metrics.
+    // Do not label the cause in logs — MARS should infer from metrics/deploy signals.
     console.error(
-      `[demo] DEMO_CRASH_AFTER_REQUESTS=${CRASH_AFTER} reached; exiting to simulate bad deploy`
+      JSON.stringify({
+        level: "error",
+        event: "demo_process_exit",
+        crash_after_requests: CRASH_AFTER,
+        requests_seen: requestCount,
+      })
     );
     setTimeout(() => process.exit(1), 50);
   }
@@ -200,7 +193,7 @@ async function withDemoLoad(res, work) {
 }
 
 async function handleHealth(_req, res) {
-  // Keep /api/health cheap: exact COUNT(*) over multi-million seed rows
+  // Keep /api/health cheap: exact COUNT(*) can be expensive on large tables
   // saturates the small pg pool and trips App Platform readiness / gateway 504s.
   // Use planner estimate (reltuples) so the demo still shows scale.
   let db = "skipped";
@@ -234,12 +227,13 @@ async function handleHealth(_req, res) {
       handler_delay_ms: HANDLER_DELAY_MS,
       max_inflight: MAX_INFLIGHT || null,
       pg_pool_max: PG_POOL_MAX,
-      slow_log_ms: SLOW_LOG_MS || null,
       inflight,
       peak_inflight: peakInflight,
       saturated_total: saturatedTotal,
-      cpu_burns_active: cpuBurnsActive,
-      mem_burns_active: memBurnsActive,
+      cpu_burns_active: cpuBurn ? 1 : 0,
+      mem_burns_active: memBurn ? 1 : 0,
+      cpu_burn_ends_at: cpuBurn ? isoEndsAt(cpuBurn.endsAt) : null,
+      mem_burn_ends_at: memBurn ? isoEndsAt(memBurn.endsAt) : null,
       burn_caps: (() => {
         const lim = detectMemLimitMb();
         return {
@@ -259,7 +253,6 @@ async function handleHealth(_req, res) {
       })(),
       log_markers: {
         five_xx: MARKER_5XX,
-        slow: MARKER_SLOW,
         burn_cpu: MARKER_BURN_CPU,
         burn_mem: MARKER_BURN_MEM,
         oom: MARKER_OOM,
@@ -307,7 +300,6 @@ async function handleLookupByEmail(req, res, url) {
   const email = String(url.searchParams.get("email") || "").trim().toLowerCase();
   if (!email) return json(res, 400, { error: "email query param required" });
 
-  // Latent bug path: filter on customer_email without a supporting index (see mars-demo-db).
   return withDemoLoad(res, async () => {
     const started = Date.now();
     const { rows } = await pool.query(
@@ -319,13 +311,10 @@ async function handleLookupByEmail(req, res, url) {
       [email]
     );
     maybeCrashAfterSuccess();
-    const took_ms = Date.now() - started;
-    maybeLogSlow(res, took_ms, { email, rows: rows.length, kind: "by-email" });
     json(res, 200, {
       email,
-      took_ms,
+      took_ms: Date.now() - started,
       orders: rows,
-      note: "customer_email has no index on main — concurrent hammers congest the DB",
     });
   });
 }
@@ -361,65 +350,6 @@ async function handleCancelOrder(req, res) {
     );
     maybeCrashAfterSuccess();
     json(res, 200, { order: rows[0], already_cancelled: false });
-  });
-}
-
-async function handleSeedOrders(req, res) {
-  if (!pool) return json(res, 503, { error: "DATABASE_URL not configured" });
-  const body = await readJson(req);
-  if (body.confirm !== "seed") {
-    return json(res, 400, {
-      error: 'body must include confirm: "seed"',
-      example: { confirm: "seed", count: 80000, hotpath_extra: 200 },
-    });
-  }
-  const count = Math.min(
-    SEED_MAX,
-    Math.max(0, Math.floor(Number(body.count || 80_000)))
-  );
-  const hotpathExtra = Math.min(
-    5_000,
-    Math.max(0, Math.floor(Number(body.hotpath_extra || 200)))
-  );
-  const hotpath = String(body.hotpath_email || "hotpath@example.com")
-    .trim()
-    .toLowerCase();
-
-  // Seed is intentionally outside withDemoLoad so scale knobs don't block prep.
-  const started = Date.now();
-  const before = await pool.query("SELECT COUNT(*)::bigint AS n FROM orders");
-  await pool.query(
-    `INSERT INTO orders (customer_email, amount_cents, status)
-     SELECT
-       'bulk-' || g::text || '@example.com',
-       500 + (g % 5000),
-       'created'
-     FROM generate_series(1, $1) AS g`,
-    [count]
-  );
-  if (hotpathExtra > 0) {
-    await pool.query(
-      `INSERT INTO orders (customer_email, amount_cents, status)
-       SELECT $1, 2500 + (g % 100), 'created'
-       FROM generate_series(1, $2) AS g`,
-      [hotpath, hotpathExtra]
-    );
-  }
-  const after = await pool.query("SELECT COUNT(*)::bigint AS n FROM orders");
-  const took_ms = Date.now() - started;
-  maybeLogSlow(res, took_ms, {
-    kind: "seed-orders",
-    inserted_bulk: count,
-    orders_after: Number(after.rows[0].n),
-  });
-  json(res, 200, {
-    inserted_bulk: count,
-    inserted_hotpath: hotpathExtra,
-    hotpath_email: hotpath,
-    orders_before: Number(before.rows[0].n),
-    orders_after: Number(after.rows[0].n),
-    took_ms,
-    reminder: "No index on customer_email — use Hammer lookups next",
   });
 }
 
@@ -492,6 +422,7 @@ function detectMemLimitMb() {
  * Short busy bursts on the event loop, then yield via setTimeout/setImmediate.
  * Defaults (~19ms busy / ~1ms yield @ duty 0.95 / slice 20) sustain high CPU
  * for Insights while still letting health/API run between spins.
+ * Loop reads cpuBurn.endsAt each slice so re-POSTs can extend without a second burner.
  */
 function yieldFor(ms) {
   return new Promise((resolve) => {
@@ -503,35 +434,64 @@ function yieldFor(ms) {
   });
 }
 
-async function dutyCycleCpuBurn(durationMs, dutyCycle, sliceMs) {
-  const end = performance.now() + durationMs;
+function extendBurnEndsAt(currentEndsAt, addMs, maxFromNowMs) {
+  const now = Date.now();
+  const base = Math.max(currentEndsAt || now, now);
+  return Math.min(now + maxFromNowMs, base + addMs);
+}
+
+async function runCpuBurnLoop() {
+  const started = Date.now();
   let ops = 0;
   let slices = 0;
   let x = 0x12345678;
-  while (performance.now() < end) {
-    const workMs = Math.max(
-      1,
-      Math.min(BURN_CPU_MAX_BUSY_MS, Math.floor(sliceMs * dutyCycle))
-    );
-    const pauseMs = Math.max(1, sliceMs - workMs);
-    const sliceEnd = performance.now() + workMs;
-    while (performance.now() < sliceEnd) {
-      for (let i = 0; i < 512; i++) {
-        x = Math.imul(x, 1664525) + 1013904223;
+  try {
+    while (cpuBurn && Date.now() < cpuBurn.endsAt) {
+      const dutyCycle = cpuBurn.dutyCycle;
+      const sliceMs = cpuBurn.sliceMs;
+      const workMs = Math.max(
+        1,
+        Math.min(BURN_CPU_MAX_BUSY_MS, Math.floor(sliceMs * dutyCycle))
+      );
+      const pauseMs = Math.max(1, sliceMs - workMs);
+      const sliceEnd = performance.now() + workMs;
+      while (performance.now() < sliceEnd) {
+        for (let i = 0; i < 512; i++) {
+          x = Math.imul(x, 1664525) + 1013904223;
+        }
+        ops += 512;
       }
-      ops += 512;
+      slices += 1;
+      await yieldFor(pauseMs);
     }
-    slices += 1;
-    await yieldFor(pauseMs);
+    console.error(
+      JSON.stringify({
+        marker: MARKER_BURN_CPU,
+        event: "end",
+        took_ms: Date.now() - started,
+        ops,
+        slices,
+        rss_mb: rssMb(),
+      })
+    );
+  } catch (err) {
+    console.error(
+      JSON.stringify({
+        marker: MARKER_BURN_CPU,
+        event: "error",
+        error: err.message,
+        rss_mb: rssMb(),
+      })
+    );
+  } finally {
+    cpuBurn = null;
   }
-  return { ops, slices, x };
 }
 
 /**
  * POST/GET /api/demo/burn-cpu
  * Background duty-cycled burn; returns 202 immediately.
- * Params: duration_ms (default 90000), duty_cycle|target_pct (default 0.95), slice_ms (default 20).
- * Legacy `workers` ignored — worker pegs cause 504s on 1 vCPU.
+ * Re-POST while active extends endsAt by duration_ms (capped).
  */
 async function handleBurnCpu(req, res, url) {
   const body = req.method === "POST" ? await readJson(req) : {};
@@ -562,33 +522,59 @@ async function handleBurnCpu(req, res, url) {
     url.searchParams.get("allow_stack") === "1" ||
     url.searchParams.get("allow_stack") === "true";
 
-  if (cpuBurnsActive >= 1) {
-    return json(res, 429, {
-      error: "cpu burn already in progress",
-      cpu_burns_active: cpuBurnsActive,
-      hint: "wait for the current burn to finish (only one sustained CPU burn at a time)",
-    });
-  }
-  if (memBurnsActive >= 1 && !allowStack) {
+  if (memBurn && !allowStack) {
     return json(res, 429, {
       error: "memory burn in progress — refuse stacking CPU+mem on small instances",
-      mem_burns_active: memBurnsActive,
+      mem_burns_active: 1,
+      mem_burn_ends_at: isoEndsAt(memBurn.endsAt),
       hint: "wait for mem burn to end, or pass allow_stack:true (OOM risk on 0.5GiB)",
     });
   }
 
-  cpuBurnsActive += 1;
-  const started = Date.now();
   const workMs = Math.max(
     1,
     Math.min(BURN_CPU_MAX_BUSY_MS, Math.floor(sliceMs * dutyCycle))
   );
   const pauseMs = Math.max(1, sliceMs - workMs);
+
+  if (cpuBurn) {
+    cpuBurn.endsAt = extendBurnEndsAt(cpuBurn.endsAt, durationMs, BURN_CPU_MAX_MS);
+    cpuBurn.dutyCycle = dutyCycle;
+    cpuBurn.sliceMs = sliceMs;
+    console.error(
+      JSON.stringify({
+        marker: MARKER_BURN_CPU,
+        event: "extend",
+        added_ms: durationMs,
+        ends_at: isoEndsAt(cpuBurn.endsAt),
+        duty_cycle: dutyCycle,
+        slice_ms: sliceMs,
+        rss_mb: rssMb(),
+      })
+    );
+    return json(res, 202, {
+      ok: true,
+      accepted: true,
+      extended: true,
+      burn: "cpu",
+      added_ms: durationMs,
+      new_ends_at: isoEndsAt(cpuBurn.endsAt),
+      ends_in_ms: Math.max(0, cpuBurn.endsAt - Date.now()),
+      duty_cycle: dutyCycle,
+      slice_ms: sliceMs,
+      marker: MARKER_BURN_CPU,
+      rss_mb: rssMb(),
+    });
+  }
+
+  const endsAt = Date.now() + durationMs;
+  cpuBurn = { endsAt, dutyCycle, sliceMs, startedAt: Date.now() };
   console.error(
     JSON.stringify({
       marker: MARKER_BURN_CPU,
       event: "start",
       duration_ms: durationMs,
+      ends_at: isoEndsAt(endsAt),
       duty_cycle: dutyCycle,
       slice_ms: sliceMs,
       work_ms_per_slice: workMs,
@@ -596,46 +582,20 @@ async function handleBurnCpu(req, res, url) {
       mode: "duty_cycle_event_loop",
       rss_mb: rssMb(),
       caps: { max_ms: BURN_CPU_MAX_MS },
-      note: "short busy bursts + setTimeout yield; avoids 1-vCPU worker starvation 504s",
+      note: "short busy bursts + setTimeout yield; re-POST extends ends_at",
     })
   );
-
-  dutyCycleCpuBurn(durationMs, dutyCycle, sliceMs)
-    .then((result) => {
-      console.error(
-        JSON.stringify({
-          marker: MARKER_BURN_CPU,
-          event: "end",
-          duration_ms: durationMs,
-          duty_cycle: dutyCycle,
-          slice_ms: sliceMs,
-          took_ms: Date.now() - started,
-          ops: result.ops,
-          slices: result.slices,
-          rss_mb: rssMb(),
-        })
-      );
-    })
-    .catch((err) => {
-      console.error(
-        JSON.stringify({
-          marker: MARKER_BURN_CPU,
-          event: "error",
-          error: err.message,
-          rss_mb: rssMb(),
-        })
-      );
-    })
-    .finally(() => {
-      cpuBurnsActive -= 1;
-    });
+  runCpuBurnLoop();
 
   return json(res, 202, {
     ok: true,
     accepted: true,
+    extended: false,
     burn: "cpu",
     mode: "duty_cycle_event_loop",
     duration_ms: durationMs,
+    new_ends_at: isoEndsAt(endsAt),
+    ends_in_ms: durationMs,
     duty_cycle: dutyCycle,
     slice_ms: sliceMs,
     work_ms_per_slice: workMs,
@@ -643,7 +603,7 @@ async function handleBurnCpu(req, res, url) {
     marker: MARKER_BURN_CPU,
     rss_mb: rssMb(),
     note:
-      "Sustained short busy/yield burn — HTTP should stay healthy; watch Insights CPU over ~duration_ms",
+      "Sustained short busy/yield burn — HTTP should stay healthy; re-POST extends duration",
   });
 }
 
@@ -682,11 +642,38 @@ async function growRssTowardTarget(targetRssMb, chunkMb) {
   return { chunks, allocatedMb, rss_mb: rssMb() };
 }
 
+function scheduleMemBurnRelease() {
+  if (!memBurn) return;
+  if (memBurn.releaseTimer) clearTimeout(memBurn.releaseTimer);
+  const delay = Math.max(0, memBurn.endsAt - Date.now());
+  memBurn.releaseTimer = setTimeout(() => {
+    const burn = memBurn;
+    if (!burn) return;
+    for (const buf of burn.chunks) {
+      const idx = retainedMemChunks.indexOf(buf);
+      if (idx >= 0) retainedMemChunks.splice(idx, 1);
+    }
+    burn.chunks.length = 0;
+    memBurn = null;
+    console.error(
+      JSON.stringify({
+        marker: MARKER_BURN_MEM,
+        event: "end",
+        target_pct: burn.targetPct,
+        limit_mb: burn.limitMb,
+        target_rss_mb: burn.targetRssMb,
+        took_ms: Date.now() - burn.startedAt,
+        rss_mb_after: rssMb(),
+        retained_chunks: retainedMemChunks.length,
+      })
+    );
+  }, delay);
+}
+
 /**
  * POST/GET /api/demo/burn-memory
- * Grow RSS toward target_pct (default 0.95) of the instance memory limit, hold hold_ms.
- * Params: target_pct, hold_ms. Optional legacy `mb` ignored for sizing (logged if present).
- * Single active mem burn only (429 on second click).
+ * Grow RSS toward target_pct of the instance memory limit, then hold.
+ * Re-POST while active extends hold endsAt by hold_ms (capped) — no second retain.
  */
 async function handleBurnMemory(req, res, url) {
   const body = req.method === "POST" ? await readJson(req) : {};
@@ -707,18 +694,42 @@ async function handleBurnMemory(req, res, url) {
     url.searchParams.get("allow_stack") === "1" ||
     url.searchParams.get("allow_stack") === "true";
 
-  if (memBurnsActive >= 1) {
-    return json(res, 429, {
-      error: "memory burn already in progress",
-      mem_burns_active: memBurnsActive,
-      hint: "Do not double-click — wait for hold_ms to end. A second retain OOMs 0.5GiB (exit 128 → gateway 504s while restarting)",
-    });
-  }
-  if (cpuBurnsActive >= 1 && !allowStack) {
+  if (cpuBurn && !allowStack) {
     return json(res, 429, {
       error: "cpu burn in progress — refuse stacking CPU+mem on small instances",
-      cpu_burns_active: cpuBurnsActive,
+      cpu_burns_active: 1,
+      cpu_burn_ends_at: isoEndsAt(cpuBurn.endsAt),
       hint: "wait for CPU burn to end, or pass allow_stack:true (OOM risk on 0.5GiB)",
+    });
+  }
+
+  if (memBurn) {
+    memBurn.endsAt = extendBurnEndsAt(memBurn.endsAt, holdMs, BURN_MEM_MAX_HOLD_MS);
+    if (memBurn.phase === "holding") scheduleMemBurnRelease();
+    console.error(
+      JSON.stringify({
+        marker: MARKER_BURN_MEM,
+        event: "extend",
+        added_ms: holdMs,
+        ends_at: isoEndsAt(memBurn.endsAt),
+        phase: memBurn.phase,
+        rss_mb: rssMb(),
+      })
+    );
+    return json(res, 202, {
+      ok: true,
+      accepted: true,
+      extended: true,
+      burn: "memory",
+      added_ms: holdMs,
+      new_ends_at: isoEndsAt(memBurn.endsAt),
+      ends_in_ms: Math.max(0, memBurn.endsAt - Date.now()),
+      phase: memBurn.phase,
+      target_pct: memBurn.targetPct,
+      limit_mb: memBurn.limitMb,
+      marker: MARKER_BURN_MEM,
+      rss_mb: rssMb(),
+      retained_chunks: retainedMemChunks.length,
     });
   }
 
@@ -738,8 +749,19 @@ async function handleBurnMemory(req, res, url) {
     });
   }
 
-  memBurnsActive += 1;
-  const started = Date.now();
+  const endsAt = Date.now() + holdMs;
+  memBurn = {
+    endsAt,
+    targetPct,
+    limitMb,
+    limitSource,
+    targetRssMb,
+    chunks: [],
+    startedAt: Date.now(),
+    phase: "growing",
+    releaseTimer: null,
+    allocatedMb: 0,
+  };
   console.error(
     JSON.stringify({
       marker: MARKER_BURN_MEM,
@@ -749,9 +771,9 @@ async function handleBurnMemory(req, res, url) {
       limit_source: limitSource,
       target_rss_mb: targetRssMb,
       hold_ms: holdMs,
+      ends_at: isoEndsAt(endsAt),
       rss_mb_before: rssBefore,
       chunk_mb: BURN_MEM_CHUNK_MB,
-      legacy_mb_ignored: body.mb ?? url.searchParams.get("mb") ?? null,
       mode: "grow_to_target_pct",
       warning:
         "Exit 128 after BURN_MEM = cgroup OOM kill (unloggable SIGKILL); gateway 504s until restart",
@@ -762,7 +784,7 @@ async function handleBurnMemory(req, res, url) {
   try {
     grow = await growRssTowardTarget(targetRssMb, BURN_MEM_CHUNK_MB);
   } catch (err) {
-    memBurnsActive -= 1;
+    memBurn = null;
     console.error(
       JSON.stringify({
         marker: MARKER_BURN_MEM,
@@ -787,36 +809,26 @@ async function handleBurnMemory(req, res, url) {
     );
   }
 
-  const rssAfterAlloc = grow.rss_mb;
-  const chunks = grow.chunks;
-  setTimeout(() => {
-    for (const buf of chunks) {
+  if (!memBurn) {
+    // Cleared unexpectedly; still drop chunks.
+    for (const buf of grow.chunks) {
       const idx = retainedMemChunks.indexOf(buf);
       if (idx >= 0) retainedMemChunks.splice(idx, 1);
     }
-    chunks.length = 0;
-    memBurnsActive -= 1;
-    console.error(
-      JSON.stringify({
-        marker: MARKER_BURN_MEM,
-        event: "end",
-        target_pct: targetPct,
-        limit_mb: limitMb,
-        limit_source: limitSource,
-        target_rss_mb: targetRssMb,
-        hold_ms: holdMs,
-        allocated_mb: grow.allocatedMb,
-        took_ms: Date.now() - started,
-        rss_mb_before: rssBefore,
-        rss_mb_after: rssMb(),
-        retained_chunks: retainedMemChunks.length,
-      })
-    );
-  }, holdMs);
+    return json(res, 500, { error: "memory burn aborted" }, { skipFiveXxLog: true });
+  }
+
+  memBurn.chunks = grow.chunks;
+  memBurn.allocatedMb = grow.allocatedMb;
+  memBurn.phase = "holding";
+  // Extensions during grow may have pushed endsAt; ensure at least holdMs from now.
+  memBurn.endsAt = Math.max(memBurn.endsAt, Date.now() + Math.min(holdMs, 1000));
+  scheduleMemBurnRelease();
 
   return json(res, 202, {
     ok: true,
     accepted: true,
+    extended: false,
     burn: "memory",
     mode: "grow_to_target_pct",
     target_pct: targetPct,
@@ -824,14 +836,44 @@ async function handleBurnMemory(req, res, url) {
     limit_source: limitSource,
     target_rss_mb: targetRssMb,
     hold_ms: holdMs,
+    new_ends_at: isoEndsAt(memBurn.endsAt),
+    ends_in_ms: Math.max(0, memBurn.endsAt - Date.now()),
     allocated_mb: grow.allocatedMb,
     marker: MARKER_BURN_MEM,
     rss_mb_before: rssBefore,
-    rss_mb_after_alloc: rssAfterAlloc,
+    rss_mb_after_alloc: grow.rss_mb,
     retained_chunks: retainedMemChunks.length,
     note:
-      "Grew RSS toward ~target_pct of instance limit and holding — headroom left for HTTP; do not double-click",
+      "Grew RSS toward ~target_pct of instance limit and holding — re-POST extends hold",
   });
+}
+
+/**
+ * POST /api/demo/crash-now — exit(1) so App Platform restarts the instance.
+ * Body: { "confirm": "crash" }. No DEMO_CRASH_AFTER_REQUESTS redeploy needed.
+ * Organic signal is do.apps.app_restarts_total / crash-loop gauges — not a log marker.
+ */
+async function handleCrashNow(req, res) {
+  const body = await readJson(req);
+  if (String(body.confirm || "") !== "crash") {
+    return json(res, 400, {
+      error: 'pass {"confirm":"crash"} to exit the process (App Platform will restart)',
+    });
+  }
+  console.error(
+    JSON.stringify({
+      level: "error",
+      event: "demo_process_exit",
+      source: "crash_now",
+    })
+  );
+  // Answer first so the client sees 202; process dies moments later.
+  json(res, 202, {
+    ok: true,
+    accepted: true,
+    note: "process will exit(1) shortly — expect gateway 504 until restart",
+  });
+  setTimeout(() => process.exit(1), 80);
 }
 
 const server = http.createServer(async (req, res) => {
@@ -858,9 +900,6 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && path === "/orders/by-email") {
       return await handleLookupByEmail(req, res, url);
     }
-    if (req.method === "POST" && path === "/demo/seed-orders") {
-      return await handleSeedOrders(req, res);
-    }
     if (
       (req.method === "POST" || req.method === "GET") &&
       path === "/demo/burn-cpu"
@@ -872,6 +911,9 @@ const server = http.createServer(async (req, res) => {
       path === "/demo/burn-memory"
     ) {
       return await handleBurnMemory(req, res, url);
+    }
+    if (req.method === "POST" && path === "/demo/crash-now") {
+      return await handleCrashNow(req, res);
     }
     json(res, 404, { error: "not found" });
   } catch (err) {
@@ -901,8 +943,8 @@ for (const sig of ["SIGTERM", "SIGINT"]) {
         event: "process_signal",
         signal: sig,
         rss_mb: rssMb(),
-        cpu_burns_active: cpuBurnsActive,
-        mem_burns_active: memBurnsActive,
+        cpu_burns_active: cpuBurn ? 1 : 0,
+        mem_burns_active: memBurn ? 1 : 0,
         note: "Graceful signal — if App Platform logged exit 128 right after BURN_MEM, that was OOM/SIGKILL (unloggable); gateway 504s until the new process listens",
       })
     );
