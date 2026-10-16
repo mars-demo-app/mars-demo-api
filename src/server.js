@@ -69,7 +69,6 @@ const BURN_MEM_LIMIT_FALLBACK_MB = Math.max(
 const MARKER_5XX = "MARS_DEMO_5XX";
 const MARKER_SLOW = "MARS_DEMO_SLOW";
 const MARKER_CANCEL_BREAK = "MARS_DEMO_ERROR_LOG";
-const MARKER_BAD_DEPLOY = "MARS_DEMO_BAD_DEPLOY";
 const MARKER_BURN_CPU = "MARS_DEMO_BURN_CPU";
 const MARKER_BURN_MEM = "MARS_DEMO_BURN_MEM";
 const MARKER_OOM = "MARS_DEMO_OOM";
@@ -167,20 +166,15 @@ function maybeCrashAfterSuccess() {
   if (!CRASH_AFTER || CRASH_AFTER <= 0) return;
   requestCount += 1;
   if (requestCount >= CRASH_AFTER) {
-    // Structured marker first so fat/enrich can match without relying on
-    // OTLP severity (App Platform often ships severity_number=0).
+    // Intentional exit so App Platform increments restart metrics.
+    // Do not label the cause in logs — MARS should infer from metrics/deploy signals.
     console.error(
       JSON.stringify({
-        marker: MARKER_BAD_DEPLOY,
         level: "error",
-        kind: "bad_deploy",
+        event: "demo_process_exit",
         crash_after_requests: CRASH_AFTER,
         requests_seen: requestCount,
-        note: "exiting to simulate bad deploy",
       })
-    );
-    console.error(
-      `[demo] ${MARKER_BAD_DEPLOY} DEMO_CRASH_AFTER_REQUESTS=${CRASH_AFTER} reached; exiting to simulate bad deploy`
     );
     setTimeout(() => process.exit(1), 50);
   }
@@ -275,7 +269,6 @@ async function handleHealth(_req, res) {
       log_markers: {
         five_xx: MARKER_5XX,
         slow: MARKER_SLOW,
-        bad_deploy: MARKER_BAD_DEPLOY,
         burn_cpu: MARKER_BURN_CPU,
         burn_mem: MARKER_BURN_MEM,
         oom: MARKER_OOM,
@@ -881,34 +874,28 @@ async function handleDemoSlow(req, res, url) {
 }
 
 /**
- * POST /api/demo/crash-now — emit MARS_DEMO_BAD_DEPLOY and exit(1).
- * Body: { "confirm": "crash" }. No redeploy / DEMO_CRASH_AFTER_REQUESTS needed.
- * App Platform restart increments do.apps.app_restarts_total for fat detectors.
+ * POST /api/demo/crash-now — exit(1) so App Platform restarts the instance.
+ * Body: { "confirm": "crash" }. No DEMO_CRASH_AFTER_REQUESTS redeploy needed.
+ * Organic signal is do.apps.app_restarts_total / crash-loop gauges — not a log marker.
  */
 async function handleCrashNow(req, res) {
   const body = await readJson(req);
   if (String(body.confirm || "") !== "crash") {
     return json(res, 400, {
-      error: 'pass {"confirm":"crash"} to emit MARS_DEMO_BAD_DEPLOY and exit',
+      error: 'pass {"confirm":"crash"} to exit the process (App Platform will restart)',
     });
   }
   console.error(
     JSON.stringify({
-      marker: MARKER_BAD_DEPLOY,
       level: "error",
-      kind: "bad_deploy",
-      event: "crash_now",
-      note: "exiting to simulate bad deploy",
+      event: "demo_process_exit",
+      source: "crash_now",
     })
-  );
-  console.error(
-    `[demo] ${MARKER_BAD_DEPLOY} crash-now; exiting to simulate bad deploy`
   );
   // Answer first so the client sees 202; process dies moments later.
   json(res, 202, {
     ok: true,
     accepted: true,
-    marker: MARKER_BAD_DEPLOY,
     note: "process will exit(1) shortly — expect gateway 504 until restart",
   });
   setTimeout(() => process.exit(1), 80);

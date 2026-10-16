@@ -26,7 +26,7 @@ Backend HTTP service for the **Mars Demo Shop** on DigitalOcean App Platform.
 | `GET`/`POST` | `/api/demo/burn-cpu` | Duty-cycled CPU burn — **202** background (`duration_ms`, `duty_cycle`) |
 | `GET`/`POST` | `/api/demo/burn-memory` | Grow RSS to `target_pct` of mem limit — **202** background |
 | `GET`/`POST` | `/api/demo/slow` | Delayed 200 → exact `MARS_DEMO_SLOW`; drive p95 |
-| `POST` | `/api/demo/crash-now` | Exact `MARS_DEMO_BAD_DEPLOY` + `exit(1)` (`{"confirm":"crash"}`) |
+| `POST` | `/api/demo/crash-now` | Intentional `exit(1)` for App Platform restart metrics (`{"confirm":"crash"}`) |
 
 ## Local run
 
@@ -45,7 +45,7 @@ Defaults are safe for normal browsing (no artificial delay, unlimited inflight).
 
 | Env | Default | Purpose |
 | --- | --- | --- |
-| `DEMO_CRASH_AFTER_REQUESTS` | `0` | Exit after N successful demo requests (bad deploy) |
+| `DEMO_CRASH_AFTER_REQUESTS` | `0` | Exit after N successful demo requests (raises restart metrics) |
 | `DEMO_HANDLER_DELAY_MS` | `0` | Artificial delay on non-health handlers (scale demo) |
 | `DEMO_MAX_INFLIGHT` | `0` | Cap concurrent non-health handlers; `0` = unlimited. Over cap → HTTP 503 |
 | `DEMO_PG_POOL_MAX` | `5` | pg pool size (small → connection wait under hammer) |
@@ -81,7 +81,7 @@ Returns **202 Accepted** and burns in the background.
 | `/api/demo/burn-cpu` | `duration_ms=120000`, `duty_cycle=0.95`, `slice_ms=20` | one at a time; yields between slices; **202** |
 | `/api/demo/burn-memory` | `target_pct=0.95`, `hold_ms=120000` | one at a time; stop at 95% of limit; **202** |
 | `/api/demo/slow` | `ms≈800` (cap 15s) | sync delayed 200; emits **`MARS_DEMO_SLOW`** |
-| `/api/demo/crash-now` | `{"confirm":"crash"}` | **`MARS_DEMO_BAD_DEPLOY`** JSON + exit(1); **202** then die |
+| `/api/demo/crash-now` | `{"confirm":"crash"}` | `exit(1)` after **202** — App Platform restart / `app_restarts_total` |
 
 ```bash
 BASE=https://mars-demo-4qji6.ondigitalocean.app
@@ -103,7 +103,7 @@ for i in $(seq 1 40); do
 done
 wait
 
-# Bad deploy / restart — exact marker string + process exit (no env redeploy)
+# Restart metrics — process exit (no env redeploy); MARS infers cause from metrics/deploy signals
 curl -sS -X POST "$BASE/api/demo/crash-now" \
   -H 'Content-Type: application/json' -d '{"confirm":"crash"}'
 
@@ -113,7 +113,7 @@ DEMO_MEM_LIMIT_MB=512 npm start
 
 **Instance size tip:** Prefer **`apps-s-1vcpu-1gb`** (or larger) for memory burns. On `0.5gb`, RSS→95% is one step from OOM/exit 128 and gateway **504**s while the container restarts. CPU burns stay duty-cycled so health keeps answering on 1 vCPU.
 
-**Insights vs process:** Organic `do.apps.app_*_utilization` often peaks well below 90% even when burns succeed (CPU burn peak ~50% observed; memory Catalog can lag process RSS). Detectors should key on a **clear sustained spike vs idle**, not absolute 90. Pair with `app_request_duration_p95` (via `/demo/slow`) and `app_restarts_total` (via `/demo/crash-now`).
+**Insights vs process:** Organic `do.apps.app_*_utilization` often peaks well below 90% even when burns succeed (CPU burn peak ~50% observed; memory Catalog can lag process RSS). Detectors should key on a **clear sustained spike vs idle**, not absolute 90. Pair with `app_request_duration_p95` (via `/demo/slow`) and `app_restarts_total` / crash-loop gauges (via `/demo/crash-now`). Do **not** teach “bad deploy” via a log marker — MARS should conclude that from metrics + App Platform deploy/build signals.
 
 ### Log markers (App Platform `api` runtime logs)
 
@@ -121,7 +121,6 @@ DEMO_MEM_LIMIT_MB=512 npm start
 | --- | --- |
 | **`MARS_DEMO_5XX`** | Any HTTP 5xx the Node process returns (503 saturated, 500 handler errors, etc.) |
 | **`MARS_DEMO_SLOW`** | Successful handler slower than `DEMO_SLOW_LOG_MS` (`/demo/slow`, seed, delayed handlers) |
-| **`MARS_DEMO_BAD_DEPLOY`** | `/demo/crash-now` or `DEMO_CRASH_AFTER_REQUESTS` — JSON `{"marker":"MARS_DEMO_BAD_DEPLOY","level":"error",…}` plus plain line |
 | **`MARS_DEMO_BURN_CPU`** | CPU burn start/end (and error) |
 | **`MARS_DEMO_BURN_MEM`** | Memory burn start/end — includes `target_pct`, `limit_mb`, `rss_mb_before` / after |
 | **`MARS_DEMO_OOM`** | Process received SIGTERM/SIGINT (graceful). **Cannot** catch cgroup OOM/SIGKILL (exit 128) |
