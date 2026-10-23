@@ -62,12 +62,6 @@ const BURN_MEM_LIMIT_FALLBACK_MB = Math.max(
   Number(process.env.DEMO_MEM_LIMIT_MB || process.env.DEMO_BURN_MEM_LIMIT_MB || 512) || 512
 );
 
-const MARKER_5XX = "MARS_DEMO_5XX";
-const MARKER_CANCEL_BREAK = "MARS_DEMO_ERROR_LOG";
-const MARKER_BURN_CPU = "MARS_DEMO_BURN_CPU";
-const MARKER_BURN_MEM = "MARS_DEMO_BURN_MEM";
-const MARKER_OOM = "MARS_DEMO_OOM";
-
 let requestCount = 0;
 let inflight = 0;
 let peakInflight = 0;
@@ -118,21 +112,19 @@ function bindRequestContext(req, res, path) {
 }
 
 /**
- * Send JSON. Every 5xx logs once with marker MARS_DEMO_5XX unless the body
- * already carries MARS_DEMO_ERROR_LOG (cancel-break path logs its own line).
+ * Send JSON. Every 5xx logs once with a neutral structured line (no magic markers).
  */
 function json(res, status, body, opts = {}) {
-  if (status >= 500 && !opts.skipFiveXxLog && body?.marker !== MARKER_CANCEL_BREAK) {
+  if (status >= 500 && !opts.skipFiveXxLog) {
     const ctx = res.__mars || {};
     console.error(
       JSON.stringify({
-        marker: MARKER_5XX,
         level: "error",
+        event: "http_error",
         status,
         method: ctx.method || null,
         path: ctx.path || null,
         error: body?.error || body?.db || "server error",
-        detail: body?.hint || body?.marker || null,
         inflight,
         demo_max_inflight: MAX_INFLIGHT || null,
       })
@@ -155,8 +147,7 @@ function maybeCrashAfterSuccess() {
     console.error(
       JSON.stringify({
         level: "error",
-        event: "demo_process_exit",
-        crash_after_requests: CRASH_AFTER,
+        event: "process_exit",
         requests_seen: requestCount,
       })
     );
@@ -179,7 +170,6 @@ async function withDemoLoad(res, work) {
       error: "api saturated",
       demo_max_inflight: MAX_INFLIGHT,
       inflight,
-      hint: "Scale the api component instance_count (or raise DEMO_MAX_INFLIGHT / lower DEMO_HANDLER_DELAY_MS)",
     });
   }
   inflight += 1;
@@ -251,12 +241,6 @@ async function handleHealth(_req, res) {
           mem_limit_source: lim.source,
         };
       })(),
-      log_markers: {
-        five_xx: MARKER_5XX,
-        burn_cpu: MARKER_BURN_CPU,
-        burn_mem: MARKER_BURN_MEM,
-        oom: MARKER_OOM,
-      },
     },
   });
 }
@@ -466,8 +450,9 @@ async function runCpuBurnLoop() {
     }
     console.error(
       JSON.stringify({
-        marker: MARKER_BURN_CPU,
-        event: "end",
+        level: "info",
+        event: "background_job_end",
+        job: "cpu",
         took_ms: Date.now() - started,
         ops,
         slices,
@@ -477,8 +462,9 @@ async function runCpuBurnLoop() {
   } catch (err) {
     console.error(
       JSON.stringify({
-        marker: MARKER_BURN_CPU,
-        event: "error",
+        level: "error",
+        event: "background_job_error",
+        job: "cpu",
         error: err.message,
         rss_mb: rssMb(),
       })
@@ -524,10 +510,9 @@ async function handleBurnCpu(req, res, url) {
 
   if (memBurn && !allowStack) {
     return json(res, 429, {
-      error: "memory burn in progress — refuse stacking CPU+mem on small instances",
+      error: "another load job is active",
       mem_burns_active: 1,
       mem_burn_ends_at: isoEndsAt(memBurn.endsAt),
-      hint: "wait for mem burn to end, or pass allow_stack:true (OOM risk on 0.5GiB)",
     });
   }
 
@@ -543,8 +528,9 @@ async function handleBurnCpu(req, res, url) {
     cpuBurn.sliceMs = sliceMs;
     console.error(
       JSON.stringify({
-        marker: MARKER_BURN_CPU,
-        event: "extend",
+        level: "info",
+        event: "background_job_extend",
+        job: "cpu",
         added_ms: durationMs,
         ends_at: isoEndsAt(cpuBurn.endsAt),
         duty_cycle: dutyCycle,
@@ -562,7 +548,6 @@ async function handleBurnCpu(req, res, url) {
       ends_in_ms: Math.max(0, cpuBurn.endsAt - Date.now()),
       duty_cycle: dutyCycle,
       slice_ms: sliceMs,
-      marker: MARKER_BURN_CPU,
       rss_mb: rssMb(),
     });
   }
@@ -571,8 +556,9 @@ async function handleBurnCpu(req, res, url) {
   cpuBurn = { endsAt, dutyCycle, sliceMs, startedAt: Date.now() };
   console.error(
     JSON.stringify({
-      marker: MARKER_BURN_CPU,
-      event: "start",
+      level: "info",
+      event: "background_job_start",
+      job: "cpu",
       duration_ms: durationMs,
       ends_at: isoEndsAt(endsAt),
       duty_cycle: dutyCycle,
@@ -582,7 +568,6 @@ async function handleBurnCpu(req, res, url) {
       mode: "duty_cycle_event_loop",
       rss_mb: rssMb(),
       caps: { max_ms: BURN_CPU_MAX_MS },
-      note: "short busy bursts + setTimeout yield; re-POST extends ends_at",
     })
   );
   runCpuBurnLoop();
@@ -600,10 +585,7 @@ async function handleBurnCpu(req, res, url) {
     slice_ms: sliceMs,
     work_ms_per_slice: workMs,
     yield_ms_per_slice: pauseMs,
-    marker: MARKER_BURN_CPU,
     rss_mb: rssMb(),
-    note:
-      "Sustained short busy/yield burn — HTTP should stay healthy; re-POST extends duration",
   });
 }
 
@@ -657,8 +639,9 @@ function scheduleMemBurnRelease() {
     memBurn = null;
     console.error(
       JSON.stringify({
-        marker: MARKER_BURN_MEM,
-        event: "end",
+        level: "info",
+        event: "background_job_end",
+        job: "memory",
         target_pct: burn.targetPct,
         limit_mb: burn.limitMb,
         target_rss_mb: burn.targetRssMb,
@@ -696,10 +679,9 @@ async function handleBurnMemory(req, res, url) {
 
   if (cpuBurn && !allowStack) {
     return json(res, 429, {
-      error: "cpu burn in progress — refuse stacking CPU+mem on small instances",
+      error: "another load job is active",
       cpu_burns_active: 1,
       cpu_burn_ends_at: isoEndsAt(cpuBurn.endsAt),
-      hint: "wait for CPU burn to end, or pass allow_stack:true (OOM risk on 0.5GiB)",
     });
   }
 
@@ -708,8 +690,9 @@ async function handleBurnMemory(req, res, url) {
     if (memBurn.phase === "holding") scheduleMemBurnRelease();
     console.error(
       JSON.stringify({
-        marker: MARKER_BURN_MEM,
-        event: "extend",
+        level: "info",
+        event: "background_job_extend",
+        job: "memory",
         added_ms: holdMs,
         ends_at: isoEndsAt(memBurn.endsAt),
         phase: memBurn.phase,
@@ -727,7 +710,6 @@ async function handleBurnMemory(req, res, url) {
       phase: memBurn.phase,
       target_pct: memBurn.targetPct,
       limit_mb: memBurn.limitMb,
-      marker: MARKER_BURN_MEM,
       rss_mb: rssMb(),
       retained_chunks: retainedMemChunks.length,
     });
@@ -745,7 +727,6 @@ async function handleBurnMemory(req, res, url) {
       target_pct: targetPct,
       limit_mb: limitMb,
       limit_source: limitSource,
-      hint: "Process is already near the burn target; wait for GC/release or lower target_pct",
     });
   }
 
@@ -764,8 +745,9 @@ async function handleBurnMemory(req, res, url) {
   };
   console.error(
     JSON.stringify({
-      marker: MARKER_BURN_MEM,
-      event: "start",
+      level: "info",
+      event: "background_job_start",
+      job: "memory",
       target_pct: targetPct,
       limit_mb: limitMb,
       limit_source: limitSource,
@@ -775,8 +757,6 @@ async function handleBurnMemory(req, res, url) {
       rss_mb_before: rssBefore,
       chunk_mb: BURN_MEM_CHUNK_MB,
       mode: "grow_to_target_pct",
-      warning:
-        "Exit 128 after BURN_MEM = cgroup OOM kill (unloggable SIGKILL); gateway 504s until restart",
     })
   );
 
@@ -787,8 +767,9 @@ async function handleBurnMemory(req, res, url) {
     memBurn = null;
     console.error(
       JSON.stringify({
-        marker: MARKER_BURN_MEM,
-        event: "error",
+        level: "error",
+        event: "background_job_error",
+        job: "memory",
         target_pct: targetPct,
         limit_mb: limitMb,
         error: err.message,
@@ -800,10 +781,8 @@ async function handleBurnMemory(req, res, url) {
       500,
       {
         error: err.message || "memory burn failed",
-        marker: MARKER_BURN_MEM,
         rss_mb: rssMb(),
         limit_mb: limitMb,
-        hint: "Allocation failed — instance may be near its memory cap",
       },
       { skipFiveXxLog: true }
     );
@@ -839,12 +818,9 @@ async function handleBurnMemory(req, res, url) {
     new_ends_at: isoEndsAt(memBurn.endsAt),
     ends_in_ms: Math.max(0, memBurn.endsAt - Date.now()),
     allocated_mb: grow.allocatedMb,
-    marker: MARKER_BURN_MEM,
     rss_mb_before: rssBefore,
     rss_mb_after_alloc: grow.rss_mb,
     retained_chunks: retainedMemChunks.length,
-    note:
-      "Grew RSS toward ~target_pct of instance limit and holding — re-POST extends hold",
   });
 }
 
@@ -863,15 +839,13 @@ async function handleCrashNow(req, res) {
   console.error(
     JSON.stringify({
       level: "error",
-      event: "demo_process_exit",
-      source: "crash_now",
+      event: "process_exit",
     })
   );
   // Answer first so the client sees 202; process dies moments later.
   json(res, 202, {
     ok: true,
     accepted: true,
-    note: "process will exit(1) shortly — expect gateway 504 until restart",
   });
   setTimeout(() => process.exit(1), 80);
 }
@@ -920,7 +894,6 @@ const server = http.createServer(async (req, res) => {
     // Structured 5xx log comes from json(); keep a one-line stack for operators.
     console.error(
       JSON.stringify({
-        marker: MARKER_5XX,
         level: "error",
         event: "unhandled_handler_error",
         method: req.method || null,
@@ -938,14 +911,12 @@ for (const sig of ["SIGTERM", "SIGINT"]) {
   process.on(sig, () => {
     console.error(
       JSON.stringify({
-        marker: MARKER_OOM,
         level: "warn",
         event: "process_signal",
         signal: sig,
         rss_mb: rssMb(),
         cpu_burns_active: cpuBurn ? 1 : 0,
         mem_burns_active: memBurn ? 1 : 0,
-        note: "Graceful signal — if App Platform logged exit 128 right after BURN_MEM, that was OOM/SIGKILL (unloggable); gateway 504s until the new process listens",
       })
     );
     process.exit(0);
