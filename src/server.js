@@ -8,19 +8,20 @@ const fs = require("node:fs");
 
 const PORT = Number(process.env.PORT || 8080);
 const DATABASE_URL = process.env.DATABASE_URL;
-const CRASH_AFTER = Number(process.env.DEMO_CRASH_AFTER_REQUESTS || 0);
-/** Artificial per-request delay for scale demos. 0 = off (safe default). */
+/** Exit process after N successful mutating handlers. 0 = off. Alias: DEMO_CRASH_AFTER_REQUESTS. */
+const EXIT_AFTER = Number(
+  process.env.DEMO_EXIT_AFTER_REQUESTS || process.env.DEMO_CRASH_AFTER_REQUESTS || 0
+);
+/** Artificial per-request delay. 0 = off (safe default). */
 const HANDLER_DELAY_MS = Math.max(0, Number(process.env.DEMO_HANDLER_DELAY_MS || 0) || 0);
-/** Cap concurrent in-flight non-health handlers. 0 = unlimited (safe default). */
+/** Cap concurrent in-flight non-health handlers. 0 = unlimited. */
 const MAX_INFLIGHT = Math.max(0, Number(process.env.DEMO_MAX_INFLIGHT || 0) || 0);
 /** pg pool size; keep modest under concurrent load. */
 const PG_POOL_MAX = Math.max(1, Number(process.env.DEMO_PG_POOL_MAX || 5) || 5);
+const SEED_MAX = 200_000;
 
 /**
- * Burn-CPU: short duty-cycled busy/yield on the event loop.
- * On 1 vCPU, a busy worker_thread still starves HTTP via the OS scheduler
- * (→ gateway 504) even while Insights averages look low. Keeping bursts
- * short (≤~10ms) lets health/API run between spins for a sustained graph.
+ * CPU load: short duty-cycled busy/yield on the event loop so HTTP stays responsive.
  */
 const BURN_CPU_MAX_MS = Math.max(100, Number(process.env.DEMO_BURN_CPU_MAX_MS || 180_000) || 180_000);
 /** Default long enough for ≥1 Insights scrape (~60s) while staying under gateway patience. */
@@ -40,9 +41,8 @@ const BURN_CPU_MAX_BUSY_MS = Math.max(
 );
 
 /**
- * Burn-memory: grow RSS toward target_pct of the instance memory limit, then hold.
- * apps-s-1vcpu-0.5gb ≈ 512MiB cgroup — default 95% crosses common 90% alert
- * thresholds while leaving ~5% headroom for HTTP. Single-burn only (exit 128 OOM).
+ * Memory load: grow RSS toward target_pct of the instance memory limit, then hold.
+ * Single active job; leave headroom so HTTP can still answer.
  */
 const BURN_MEM_MAX_HOLD_MS = Math.max(100, Number(process.env.DEMO_BURN_MEM_MAX_HOLD_MS || 180_000) || 180_000);
 /** Hold past at least one Insights memory scrape window. */
@@ -138,12 +138,10 @@ function json(res, status, body, opts = {}) {
   res.end(payload);
 }
 
-function maybeCrashAfterSuccess() {
-  if (!CRASH_AFTER || CRASH_AFTER <= 0) return;
+function maybeExitAfterSuccess() {
+  if (!EXIT_AFTER || EXIT_AFTER <= 0) return;
   requestCount += 1;
-  if (requestCount >= CRASH_AFTER) {
-    // Intentional exit so App Platform increments restart metrics.
-    // Do not label the cause in logs — MARS should infer from metrics/deploy signals.
+  if (requestCount >= EXIT_AFTER) {
     console.error(
       JSON.stringify({
         level: "error",
@@ -185,7 +183,7 @@ async function withDemoLoad(res, work) {
 async function handleHealth(_req, res) {
   // Keep /api/health cheap: exact COUNT(*) can be expensive on large tables
   // saturates the small pg pool and trips App Platform readiness / gateway 504s.
-  // Use planner estimate (reltuples) so the demo still shows scale.
+  // Use planner estimate (reltuples) — exact COUNT(*) is expensive on large tables.
   let db = "skipped";
   let orderCount = null;
   let orderCountApprox = false;
@@ -211,7 +209,7 @@ async function handleHealth(_req, res) {
     db,
     order_count: orderCount,
     order_count_approx: orderCountApprox,
-    crash_after_requests: CRASH_AFTER || null,
+    exit_after_requests: EXIT_AFTER || null,
     requests_seen: requestCount,
     demo: {
       handler_delay_ms: HANDLER_DELAY_MS,
@@ -254,7 +252,7 @@ async function handleListOrders(_req, res) {
        ORDER BY created_at DESC
        LIMIT 25`
     );
-    maybeCrashAfterSuccess();
+    maybeExitAfterSuccess();
     json(res, 200, { orders: rows });
   });
 }
@@ -274,7 +272,7 @@ async function handleCreateOrder(req, res) {
        RETURNING id, customer_email, amount_cents, status, created_at`,
       [email, Math.floor(amount)]
     );
-    maybeCrashAfterSuccess();
+    maybeExitAfterSuccess();
     json(res, 201, rows[0]);
   });
 }
@@ -294,7 +292,7 @@ async function handleLookupByEmail(req, res, url) {
        LIMIT 50`,
       [email]
     );
-    maybeCrashAfterSuccess();
+    maybeExitAfterSuccess();
     json(res, 200, {
       email,
       took_ms: Date.now() - started,
@@ -332,7 +330,7 @@ async function handleCancelOrder(req, res) {
        RETURNING id, customer_email, amount_cents, status, created_at`,
       [Math.floor(id)]
     );
-    maybeCrashAfterSuccess();
+    maybeExitAfterSuccess();
     json(res, 200, { order: rows[0], already_cancelled: false });
   });
 }
@@ -824,16 +822,67 @@ async function handleBurnMemory(req, res, url) {
   });
 }
 
+
+async function handleSeedOrders(req, res) {
+  if (!pool) return json(res, 503, { error: "DATABASE_URL not configured" });
+  const body = await readJson(req);
+  if (body.confirm !== "seed") {
+    return json(res, 400, {
+      error: 'body must include confirm: "seed"',
+      example: { confirm: "seed", count: 80000, hotpath_extra: 200 },
+    });
+  }
+  const count = Math.min(
+    SEED_MAX,
+    Math.max(0, Math.floor(Number(body.count || 80_000)))
+  );
+  const hotpathExtra = Math.min(
+    5_000,
+    Math.max(0, Math.floor(Number(body.hotpath_extra || 200)))
+  );
+  const hotpath = String(body.hotpath_email || "hotpath@example.com")
+    .trim()
+    .toLowerCase();
+
+  const started = Date.now();
+  const before = await pool.query("SELECT COUNT(*)::bigint AS n FROM orders");
+  await pool.query(
+    `INSERT INTO orders (customer_email, amount_cents, status)
+     SELECT
+       'bulk-' || g::text || '@example.com',
+       500 + (g % 5000),
+       'created'
+     FROM generate_series(1, $1) AS g`,
+    [count]
+  );
+  if (hotpathExtra > 0) {
+    await pool.query(
+      `INSERT INTO orders (customer_email, amount_cents, status)
+       SELECT $1, 2500 + (g % 100), 'created'
+       FROM generate_series(1, $2) AS g`,
+      [hotpath, hotpathExtra]
+    );
+  }
+  const after = await pool.query("SELECT COUNT(*)::bigint AS n FROM orders");
+  json(res, 200, {
+    inserted_bulk: count,
+    inserted_hotpath: hotpathExtra,
+    hotpath_email: hotpath,
+    orders_before: Number(before.rows[0].n),
+    orders_after: Number(after.rows[0].n),
+    took_ms: Date.now() - started,
+  });
+}
+
 /**
- * POST /api/demo/crash-now — exit(1) so App Platform restarts the instance.
- * Body: { "confirm": "crash" }. No DEMO_CRASH_AFTER_REQUESTS redeploy needed.
- * Organic signal is do.apps.app_restarts_total / crash-loop gauges — not a log marker.
+ * POST /api/demo/crash-now — exit(1) after accepting the request.
+ * Body: { "confirm": "crash" }.
  */
 async function handleCrashNow(req, res) {
   const body = await readJson(req);
   if (String(body.confirm || "") !== "crash") {
     return json(res, 400, {
-      error: 'pass {"confirm":"crash"} to exit the process (App Platform will restart)',
+      error: 'pass {"confirm":"crash"} to proceed',
     });
   }
   console.error(
@@ -886,6 +935,9 @@ const server = http.createServer(async (req, res) => {
     ) {
       return await handleBurnMemory(req, res, url);
     }
+    if (req.method === "POST" && path === "/demo/seed-orders") {
+      return await handleSeedOrders(req, res);
+    }
     if (req.method === "POST" && path === "/demo/crash-now") {
       return await handleCrashNow(req, res);
     }
@@ -926,7 +978,7 @@ for (const sig of ["SIGTERM", "SIGINT"]) {
 server.listen(PORT, () => {
   console.log(`mars-demo-api listening on :${PORT}`);
   console.log(
-    `demo knobs: DELAY_MS=${HANDLER_DELAY_MS} MAX_INFLIGHT=${MAX_INFLIGHT || "unlimited"} PG_POOL_MAX=${PG_POOL_MAX} MEM_TARGET_PCT=${BURN_MEM_DEFAULT_TARGET_PCT} MEM_LIMIT_FALLBACK_MB=${BURN_MEM_LIMIT_FALLBACK_MB}`
+    `runtime: DELAY_MS=${HANDLER_DELAY_MS} MAX_INFLIGHT=${MAX_INFLIGHT || "unlimited"} PG_POOL_MAX=${PG_POOL_MAX} MEM_TARGET_PCT=${BURN_MEM_DEFAULT_TARGET_PCT} MEM_LIMIT_FALLBACK_MB=${BURN_MEM_LIMIT_FALLBACK_MB}`
   );
   if (!DATABASE_URL) {
     console.warn("DATABASE_URL is not set; DB routes will return 503");

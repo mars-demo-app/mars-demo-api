@@ -17,14 +17,15 @@ Backend HTTP service for the **Mars Demo Shop** on DigitalOcean App Platform.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/api/health` (or `/health`) | Liveness + DB ping + demo knobs |
+| `GET` | `/api/health` (or `/health`) | Liveness + DB ping + runtime knobs |
 | `GET` | `/api/orders` | Recent orders |
 | `POST` | `/api/orders` | Create order `{ customer_email, amount_cents }` |
 | `POST` | `/api/orders/cancel` | Soft-cancel order `{ id }` → `status: cancelled` |
 | `GET` | `/api/orders/by-email?email=` | Lookup orders by email (normal app traffic) |
 | `GET`/`POST` | `/api/demo/burn-cpu` | Duty-cycled CPU load — **202**; re-POST **extends** duration |
 | `GET`/`POST` | `/api/demo/burn-memory` | Grow RSS to `target_pct` of mem limit — **202**; re-POST **extends** hold |
-| `POST` | `/api/demo/crash-now` | Intentional `exit(1)` for App Platform restart metrics (`{"confirm":"crash"}`) |
+| `POST` | `/api/demo/crash-now` | `exit(1)` after `{"confirm":"crash"}` |
+| `POST` | `/api/demo/seed-orders` | Bulk insert sample orders (`confirm: "seed"`) |
 
 ## Local run
 
@@ -37,14 +38,14 @@ npm start
 # http://127.0.0.1:8080/health
 ```
 
-## Demo knobs (env)
+## Runtime knobs (env)
 
 Defaults are safe for normal browsing (no artificial delay, unlimited inflight).
 
 | Env | Default | Purpose |
 | --- | --- | --- |
-| `DEMO_CRASH_AFTER_REQUESTS` | `0` | Exit after N successful demo requests (raises restart metrics) |
-| `DEMO_HANDLER_DELAY_MS` | `0` | Artificial delay on non-health handlers (scale demo) |
+| `DEMO_EXIT_AFTER_REQUESTS` | `0` | Exit after N successful handlers (alias `DEMO_CRASH_AFTER_REQUESTS`) |
+| `DEMO_HANDLER_DELAY_MS` | `0` | Artificial delay on non-health handlers |
 | `DEMO_MAX_INFLIGHT` | `0` | Cap concurrent non-health handlers; `0` = unlimited. Over cap → HTTP 503 |
 | `DEMO_PG_POOL_MAX` | `5` | pg pool size |
 | `DEMO_BURN_CPU_MAX_MS` | `180000` | Hard cap for one CPU burn window from “now” when extending |
@@ -58,7 +59,7 @@ Defaults are safe for normal browsing (no artificial delay, unlimited inflight).
 
 ### Load demos (CPU / memory / restart)
 
-Returns **202 Accepted** and runs work in the background. Logs and API bodies are **neutral** — no magic `MARS_DEMO_*` strings, no copy that names a root cause. MARS should infer from App Platform / Insights metrics alone.
+Returns **202 Accepted** and runs work in the background. Runtime logs and API bodies stay neutral.
 
 **CPU** — short event-loop busy/yield (`duty_cycle`/`target_pct`=0.95, `slice_ms`=20). One active burner; a second `POST` **extends** `ends_at` by `duration_ms` (capped) and returns `extended: true`, `new_ends_at`. Stacking on an active mem burn → **429** unless `allow_stack:true`.
 
@@ -77,7 +78,8 @@ Returns **202 Accepted** and runs work in the background. Logs and API bodies ar
 | --- | --- | --- |
 | `/api/demo/burn-cpu` | `duration_ms=120000`, `duty_cycle=0.95` | **202**; re-POST extends |
 | `/api/demo/burn-memory` | `target_pct=0.95`, `hold_ms=120000` | **202**; re-POST extends hold |
-| `/api/demo/crash-now` | `{"confirm":"crash"}` | `exit(1)` after **202** — restart metrics |
+| `/api/demo/crash-now` | `{"confirm":"crash"}` | `exit(1)` after **202** |
+| `/api/demo/seed-orders` | `confirm: "seed"` | bulk insert sample rows |
 
 ```bash
 BASE=https://mars-demo-4qji6.ondigitalocean.app

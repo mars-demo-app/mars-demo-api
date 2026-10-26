@@ -29,12 +29,12 @@ services:
       - key: DATABASE_URL
         scope: RUN_TIME
         value: ${db.DATABASE_URL}
-      # Demo toggle for MARS scenario 2a (crash-after-usage). "0" = healthy.
-      - key: DEMO_CRASH_AFTER_REQUESTS
+      # Optional process-exit after N successful handlers. "0" = off.
+      # Prefer DEMO_EXIT_AFTER_REQUESTS; DEMO_CRASH_AFTER_REQUESTS still accepted by the app.
+      - key: DEMO_EXIT_AFTER_REQUESTS
         scope: RUN_TIME
         value: "0"
-      # Scale demo knobs — keep at 0 for normal browsing; raise in App Platform
-      # console for traffic→scale (see repo-setup-status playbook C).
+      # Load gates — keep at 0 for normal browsing; raise in App Platform console when needed.
       - key: DEMO_HANDLER_DELAY_MS
         scope: RUN_TIME
         value: "0"
