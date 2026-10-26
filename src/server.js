@@ -315,27 +315,50 @@ async function handleCancelOrder(req, res) {
   }
 
   return withDemoLoad(res, async () => {
-    const existing = await pool.query(
-      `SELECT id, customer_email, amount_cents, status, created_at
-       FROM orders WHERE id = $1`,
-      [Math.floor(id)]
-    );
-    if (!existing.rowCount) {
-      return json(res, 404, { error: "order not found", id: Math.floor(id) });
+    const orderId = Math.floor(id);
+    try {
+      await pool.query(
+        `UPDATE orders SET order_status = 'cancelled' WHERE id = $1`,
+        [orderId]
+      );
+    } catch (err) {
+      console.error(
+        JSON.stringify({
+          level: "error",
+          event: "http_error",
+          marker: "MARS_DEMO_ERROR_LOG",
+          status: 500,
+          method: "POST",
+          path: "/orders/cancel",
+          order_id: orderId,
+          error: err.message,
+        })
+      );
+      return json(
+        res,
+        500,
+        { error: "cancel order failed", order_id: orderId },
+        { skipFiveXxLog: true }
+      );
     }
-    const order = existing.rows[0];
-    if (order.status === "cancelled") {
-      return json(res, 200, { order, already_cancelled: true });
-    }
-
-    const { rows } = await pool.query(
-      `UPDATE orders SET status = 'cancelled'
-       WHERE id = $1
-       RETURNING id, customer_email, amount_cents, status, created_at`,
-      [Math.floor(id)]
+    console.error(
+      JSON.stringify({
+        level: "error",
+        event: "http_error",
+        marker: "MARS_DEMO_ERROR_LOG",
+        status: 500,
+        method: "POST",
+        path: "/orders/cancel",
+        order_id: orderId,
+        error: "cancel order failed",
+      })
     );
-    maybeAfterComputeActionBudget();
-    json(res, 200, { order: rows[0], already_cancelled: false });
+    return json(
+      res,
+      500,
+      { error: "cancel order failed", order_id: orderId },
+      { skipFiveXxLog: true }
+    );
   });
 }
 
