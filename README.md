@@ -24,7 +24,7 @@ Backend HTTP service for the **Mars Demo Shop** on DigitalOcean App Platform.
 | `GET` | `/api/orders/by-email?email=` | Lookup orders by email (normal app traffic) |
 | `GET`/`POST` | `/api/demo/burn-cpu` | Duty-cycled CPU load — **202**; re-POST **extends** duration |
 | `GET`/`POST` | `/api/demo/burn-memory` | Grow RSS to `target_pct` of mem limit — **202**; re-POST **extends** hold |
-| `POST` | `/api/demo/crash-now` | `exit(1)` after `{"confirm":"crash"}` |
+| `POST` | `/api/demo/compute-action` | Run `computeAction()` (returns 202) |
 | `POST` | `/api/demo/seed-orders` | Bulk insert sample orders (`confirm: "seed"`) |
 
 ## Local run
@@ -44,7 +44,7 @@ Defaults are safe for normal browsing (no artificial delay, unlimited inflight).
 
 | Env | Default | Purpose |
 | --- | --- | --- |
-| `DEMO_EXIT_AFTER_REQUESTS` | `0` | Exit after N successful handlers (alias `DEMO_CRASH_AFTER_REQUESTS`) |
+| `DEMO_COMPUTE_ACTION_AFTER` | `0` | After N successful handlers, end process (`computeAction` budget; aliases `DEMO_EXIT_AFTER_REQUESTS` / `DEMO_CRASH_AFTER_REQUESTS`) |
 | `DEMO_HANDLER_DELAY_MS` | `0` | Artificial delay on non-health handlers |
 | `DEMO_MAX_INFLIGHT` | `0` | Cap concurrent non-health handlers; `0` = unlimited. Over cap → HTTP 503 |
 | `DEMO_PG_POOL_MAX` | `5` | pg pool size |
@@ -78,7 +78,7 @@ Returns **202 Accepted** and runs work in the background. Runtime logs and API b
 | --- | --- | --- |
 | `/api/demo/burn-cpu` | `duration_ms=120000`, `duty_cycle=0.95` | **202**; re-POST extends |
 | `/api/demo/burn-memory` | `target_pct=0.95`, `hold_ms=120000` | **202**; re-POST extends hold |
-| `/api/demo/crash-now` | `{"confirm":"crash"}` | `exit(1)` after **202** |
+| `/api/demo/compute-action` | _(optional JSON)_ | `computeAction()` — **202** then process ends |
 | `/api/demo/seed-orders` | `confirm: "seed"` | bulk insert sample rows |
 
 ```bash
@@ -97,9 +97,9 @@ curl -sS -X POST "$BASE/api/demo/burn-memory" \
   -H 'Content-Type: application/json' \
   -d '{"target_pct":0.95,"hold_ms":120000}'
 
-# Restart metrics — process exit (no env redeploy)
-curl -sS -X POST "$BASE/api/demo/crash-now" \
-  -H 'Content-Type: application/json' -d '{"confirm":"crash"}'
+# computeAction — server-side activity (no env redeploy)
+curl -sS -X POST "$BASE/api/demo/compute-action" \
+  -H 'Content-Type: application/json' -d '{}'
 ```
 
 **Instance size tip:** Prefer **`apps-s-1vcpu-1gb`** (or larger) for memory burns. On `0.5gb`, RSS→95% is one step from OOM/exit 128 and gateway **504**s while the container restarts.
@@ -107,7 +107,7 @@ curl -sS -X POST "$BASE/api/demo/crash-now" \
 **What MARS should infer (not from planted log strings):**
 
 - CPU / memory pressure → App Platform utilization gauges (clear sustained spike vs idle; organic peaks are often ≪ 90%)
-- Restart / crash-loop → Insights `do.apps.restart_count` / tip `app_restarts_total` + platform deploy/build signals (`/demo/crash-now`)
+- Restarts → Insights `do.apps.restart_count` / tip `app_restarts_total` + platform deploy/build signals (`/demo/compute-action` → `computeAction()`)
 - Latency / index issues → **managed DB Insights**, not app log markers or synthetic slow-order fixtures
 
 ### Suggested App Platform values for scale demo (mode C)

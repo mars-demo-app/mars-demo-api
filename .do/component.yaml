@@ -29,9 +29,9 @@ services:
       - key: DATABASE_URL
         scope: RUN_TIME
         value: ${db.DATABASE_URL}
-      # Optional process-exit after N successful handlers. "0" = off.
-      # Prefer DEMO_EXIT_AFTER_REQUESTS; DEMO_CRASH_AFTER_REQUESTS still accepted by the app.
-      - key: DEMO_EXIT_AFTER_REQUESTS
+      # Optional computeAction budget after N successful handlers. "0" = off.
+      # Prefer DEMO_COMPUTE_ACTION_AFTER; older DEMO_EXIT_AFTER_REQUESTS / DEMO_CRASH_AFTER_REQUESTS still accepted.
+      - key: DEMO_COMPUTE_ACTION_AFTER
         scope: RUN_TIME
         value: "0"
       # Load gates — keep at 0 for normal browsing; raise in App Platform console when needed.

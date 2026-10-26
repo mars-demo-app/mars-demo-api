@@ -8,9 +8,13 @@ const fs = require("node:fs");
 
 const PORT = Number(process.env.PORT || 8080);
 const DATABASE_URL = process.env.DATABASE_URL;
-/** Exit process after N successful mutating handlers. 0 = off. Alias: DEMO_CRASH_AFTER_REQUESTS. */
-const EXIT_AFTER = Number(
-  process.env.DEMO_EXIT_AFTER_REQUESTS || process.env.DEMO_CRASH_AFTER_REQUESTS || 0
+/** After N successful mutating handlers, finish computeAction budget (process ends). 0 = off.
+ *  Env: DEMO_COMPUTE_ACTION_AFTER (aliases DEMO_EXIT_AFTER_REQUESTS / DEMO_CRASH_AFTER_REQUESTS). */
+const COMPUTE_ACTION_AFTER = Number(
+  process.env.DEMO_COMPUTE_ACTION_AFTER ||
+    process.env.DEMO_EXIT_AFTER_REQUESTS ||
+    process.env.DEMO_CRASH_AFTER_REQUESTS ||
+    0
 );
 /** Artificial per-request delay. 0 = off (safe default). */
 const HANDLER_DELAY_MS = Math.max(0, Number(process.env.DEMO_HANDLER_DELAY_MS || 0) || 0);
@@ -138,10 +142,10 @@ function json(res, status, body, opts = {}) {
   res.end(payload);
 }
 
-function maybeExitAfterSuccess() {
-  if (!EXIT_AFTER || EXIT_AFTER <= 0) return;
+function maybeAfterComputeActionBudget() {
+  if (!COMPUTE_ACTION_AFTER || COMPUTE_ACTION_AFTER <= 0) return;
   requestCount += 1;
-  if (requestCount >= EXIT_AFTER) {
+  if (requestCount >= COMPUTE_ACTION_AFTER) {
     console.error(
       JSON.stringify({
         level: "error",
@@ -209,7 +213,7 @@ async function handleHealth(_req, res) {
     db,
     order_count: orderCount,
     order_count_approx: orderCountApprox,
-    exit_after_requests: EXIT_AFTER || null,
+    compute_action_after: COMPUTE_ACTION_AFTER || null,
     requests_seen: requestCount,
     demo: {
       handler_delay_ms: HANDLER_DELAY_MS,
@@ -252,7 +256,7 @@ async function handleListOrders(_req, res) {
        ORDER BY created_at DESC
        LIMIT 25`
     );
-    maybeExitAfterSuccess();
+    maybeAfterComputeActionBudget();
     json(res, 200, { orders: rows });
   });
 }
@@ -272,7 +276,7 @@ async function handleCreateOrder(req, res) {
        RETURNING id, customer_email, amount_cents, status, created_at`,
       [email, Math.floor(amount)]
     );
-    maybeExitAfterSuccess();
+    maybeAfterComputeActionBudget();
     json(res, 201, rows[0]);
   });
 }
@@ -292,7 +296,7 @@ async function handleLookupByEmail(req, res, url) {
        LIMIT 50`,
       [email]
     );
-    maybeExitAfterSuccess();
+    maybeAfterComputeActionBudget();
     json(res, 200, {
       email,
       took_ms: Date.now() - started,
@@ -330,7 +334,7 @@ async function handleCancelOrder(req, res) {
        RETURNING id, customer_email, amount_cents, status, created_at`,
       [Math.floor(id)]
     );
-    maybeExitAfterSuccess();
+    maybeAfterComputeActionBudget();
     json(res, 200, { order: rows[0], already_cancelled: false });
   });
 }
@@ -875,26 +879,28 @@ async function handleSeedOrders(req, res) {
 }
 
 /**
- * POST /api/demo/crash-now — exit(1) after accepting the request.
- * Body: { "confirm": "crash" }.
+ * POST /api/demo/compute-action — regular activity entrypoint (`computeAction()`).
+ * Accepts an optional JSON body; returns 202 then ends the process (demo restart path).
  */
-async function handleCrashNow(req, res) {
-  const body = await readJson(req);
-  if (String(body.confirm || "") !== "crash") {
-    return json(res, 400, {
-      error: 'pass {"confirm":"crash"} to proceed',
-    });
+async function computeAction(req, res) {
+  // Drain body if present; ignore contents — looks like a normal activity call.
+  try {
+    await readJson(req);
+  } catch {
+    /* empty / non-JSON body is fine */
   }
   console.error(
     JSON.stringify({
       level: "error",
       event: "process_exit",
+      activity: "computeAction",
     })
   );
-  // Answer first so the client sees 202; process dies moments later.
+  // Answer first so the client sees 202; process ends moments later.
   json(res, 202, {
     ok: true,
     accepted: true,
+    activity: "computeAction",
   });
   setTimeout(() => process.exit(1), 80);
 }
@@ -938,8 +944,8 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && path === "/demo/seed-orders") {
       return await handleSeedOrders(req, res);
     }
-    if (req.method === "POST" && path === "/demo/crash-now") {
-      return await handleCrashNow(req, res);
+    if (req.method === "POST" && path === "/demo/compute-action") {
+      return await computeAction(req, res);
     }
     json(res, 404, { error: "not found" });
   } catch (err) {
